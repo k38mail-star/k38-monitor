@@ -173,7 +173,7 @@ python3 dltrace.py \
 | 大傻 | DGX Spark 128GB | ✅ GPU 81°C |
 | 二傻 | DGX Spark 128GB | ✅ GPU 75°C |
 | 小四 | Mac Studio M4 Max | ✅ Thunderbolt |
-| 三万八 | Mac Studio M3 Ultra 96GB | ✅ WiFi |
+| 三万八 | Mac Studio M3 Ultra 96GB | ✅ Ethernet |
 
 ---
 
