@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.pid
+/tmp/dltrace.json
+.DS_Store
