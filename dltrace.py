@@ -1817,7 +1817,7 @@ body.theme-netdata .sidebar-nav .nav-item{margin:1px 4px}
 </div>
 </div>
 </div>
-<div class="header"><h1>▣ K38 MONITOR</h1><div class="sub">CLUSTER DASHBOARD · v0.3.2</div></div>
+<div class="header"><h1>▣ K38 MONITOR</h1><div class="sub">CLUSTER DASHBOARD · {{VERSION}}</div></div>
 <div class="topbar">
 <div class="theme-switch">
 <span class="theme-btn active" data-theme="s360" onclick="switchTheme('s360')">SERVER360</span>
