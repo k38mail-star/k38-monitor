@@ -106,7 +106,7 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 # 配置常量
 # ════════════════════════════════════════════
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # Web Authentication
 DLTRACE_TOKEN = os.environ.get("DLTRACE_TOKEN", "")
@@ -532,6 +532,11 @@ class DownloadTracker:
 
         # Disk percentage warning
         disk_pct = si.get("disk_pct")
+        if isinstance(disk_pct, str):
+            try:
+                disk_pct = float(disk_pct.rstrip("%"))
+            except (ValueError, AttributeError):
+                disk_pct = None
         if disk_pct is not None and disk_pct > alert_disk_pct_warning:
             alerts.append({
                 "metric": "disk_pct",
@@ -873,7 +878,7 @@ class DownloadTracker:
                     if len(parts) >= 5:
                         info["disk_total"] = parts[1]
                         info["disk_used"] = parts[2]
-                        info["disk_pct"] = parts[4].rstrip("%")
+                        info["disk_pct"] = float(parts[4].rstrip("%"))
             except (OSError, subprocess.TimeoutExpired, ValueError):
                 pass
 
@@ -954,8 +959,11 @@ class DownloadTracker:
                 )
                 clk_parts = clk_out.strip().split(",")
                 if len(clk_parts) >= 2:
-                    info["gpu_clk_graphics"] = float(clk_parts[0].strip())
-                    info["gpu_clk_memory"] = float(clk_parts[1].strip())
+                    try:
+                        info["gpu_clk_graphics"] = float(clk_parts[0].strip())
+                        info["gpu_clk_memory"] = float(clk_parts[1].strip())
+                    except (ValueError, IndexError):
+                        pass
             except Exception:
                 pass
 
@@ -1005,7 +1013,7 @@ class DownloadTracker:
                     if len(parts) >= 5:
                         info["disk_total"] = parts[1]
                         info["disk_used"] = parts[2]
-                        info["disk_pct"] = parts[4].rstrip("%")
+                        info["disk_pct"] = float(parts[4].rstrip("%"))
             except (OSError, subprocess.TimeoutExpired, ValueError): pass
             # 运行时间
             try:
@@ -1433,13 +1441,28 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
             nodes = {}
 
             # 惰性初始化自身URL(用于跳过自引用HTTP拉取)
-            if not hasattr(self, "_self_url"):
+            # 当绑定0.0.0.0时getsockname返回(0.0.0.0, port), 无法匹配硬编码url
+            # 所以额外检查: host是本机IP/0.0.0.0/127.0.0.1的也跳过
+            if not hasattr(self, "_self_port"):
                 try:
-                    sockname = self.request.getsockname()[:2]  # (ip, port)
-                    url = f"http://{sockname[0]}:{sockname[1]}/api/v1/metrics"
-                    self._self_url = url
+                    _addr, _port = self.request.getsockname()[:2]
+                    self._self_port = _port
+                    # 收集本机所有IP(含127.0.0.1)用于自引用检测
+                    if not hasattr(self, "_self_ips"):
+                        import socket as _sk
+                        self._self_ips = set()
+                        try:
+                            self._self_ips.add(_sk.gethostbyname(_sk.gethostname()))
+                        except Exception:
+                            pass
+                        self._self_ips.add('127.0.0.1')
+                        self._self_ips.add('0.0.0.0')
+                        self._self_ips.add('localhost')
+                        if _addr:
+                            self._self_ips.add(_addr)
                 except Exception:
-                    self._self_url = None
+                    self._self_port = None
+                    self._self_ips = set()
 
             # 本地节点: 总是包含
             try:
@@ -1454,7 +1477,6 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
 
             # 已知所有节点的HTTP API（支持动态配置）
             # 自动排除自身节点的HTTP拉取, 防止循环死锁
-            _self_url = getattr(self, "_self_url", None)
             KNOWN_NODES = _load_node_config(
                 hardcoded={
                     "三万八":    "http://192.168.3.29:8899/api/v1/metrics",
@@ -1475,7 +1497,21 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                 import concurrent.futures
                 futs = {}
                 for n, u in KNOWN_NODES.items():
-                    if _self_url and u == _self_url:
+                    # 跳过自引用: 精确匹配URL, 或IP是本机+端口匹配
+                    _skip = False
+                    if hasattr(self, '_self_port') and self._self_port:
+                        try:
+                            _host = u.split('/')[2].split(':')[0]
+                            _port = int(u.split(':')[-1].split('/')[0])
+                            if _port == self._self_port:
+                                if _host in getattr(self, '_self_ips', set()):
+                                    _skip = True
+                        except (ValueError, IndexError):
+                            pass
+                    if not _skip and hasattr(self, '_self_url') and self._self_url:
+                        if u == self._self_url:
+                            _skip = True
+                    if _skip:
                         continue
                     futs[pool.submit(_pull_node, n, u)] = n
                 try:
@@ -1672,9 +1708,21 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                     gpu_info = (s.get("gpu_info") or "")
                     if gpu_info: card += f'<div style="width:100%;text-align:center;margin-top:2px"><span class="gpu-tag" title="{esc(gpu_info)}">{esc(gpu_info[:30])}</span></div>'
                     if s.get("load"): card += f'<div style="width:100%;text-align:center"><span class="sys-load">LD: {esc(s["load"])}</span></div>'
-                    if s.get("gpu_clk_graphics") is not None: card += f'<span class="gpu-clk">⚡ {s["gpu_clk_graphics"]}MHz 💾 {s["gpu_clk_memory"]}MHz</span>'
+                    if s.get("gpu_clk_graphics") is not None and s.get("gpu_clk_memory") is not None: card += f'<span class="gpu-clk">⚡ {s["gpu_clk_graphics"]}MHz 💾 {s["gpu_clk_memory"]}MHz</span>'
                     if s.get("fan_rpm_avg") is not None: card += f'<span class="fan-speed">❄ {s["fan_rpm_avg"]} RPM</span>'
-                    if s.get("uptime"): card += f'<div style="width:100%;text-align:center"><span class="sys-up">{esc(s["uptime"])}</span></div>'
+                    # Public ping info (embedded from NETWORK LINKS)
+                    p = n.get("ping") or {}
+                    b = p.get("baidu_ms")
+                    g = p.get("ytb_ms")
+                    loc = p.get("public_loc", "")
+                    ping_parts = []
+                    if b is not None: ping_parts.append(f'<span style="color:#4ade80">🌐 百度 {b:.0f}ms</span>')
+                    if g is not None:
+                        gc = "#4ade80" if g < 200 else "#facc15"
+                        ping_parts.append(f'<span style="color:{gc}"> YTB {g:.0f}ms</span>')
+                    if loc: ping_parts.append(f'<span style="color:#94a3b8;margin-left:6px">📍 {esc(loc[:25])}</span>')
+                    if ping_parts:
+                        card += '<div style="width:100%;text-align:center;margin-top:3px;font-size:8px">' + " ".join(ping_parts) + '</div>'
                     card += "</div></div>"; sys_html += card
 
                 # Network section
@@ -1686,40 +1734,53 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                 net_html += f'<div class="net-200g"><span class="net-200g-icon">⚡</span><span class="net-200g-label">200G</span><span class="net-200g-nodes">{nodes_200g}</span><span class="net-200g-lat" style="color:{lkc}">{lkt}</span></div>'
                 tbs = (data.get("network") or {}).get("tb", [])
                 for tb in tbs: net_html += f'<div class="net-tb-link">🗡 {esc(tb.get("from",""))} ↔ {esc(tb.get("to",""))} <span class="net-tb-speed">{esc(tb.get("speed",""))}</span></div>'
-                net_html += '</div><div class="net-ping-grid">'
-                for h, n in ns.items():
-                    p = n.get("ping") or {}
-                    b = p.get("baidu_ms", "-")
-                    g = p.get("ytb_ms", "-")
-                    fn = NODE_NAMES.get(h, h)
-                    loc = p.get("public_loc", "")
-                    dot = "s-green" if isinstance(b, (int,float)) else "s-gray"
-                    bv = f'{b:.0f}' if isinstance(b, (int,float)) else '?'
-                    gv = f'{g:.0f}' if isinstance(g, (int,float)) else '?'
-                    bc = "c-green" if isinstance(b,(int,float)) and b < 50 else ("c-yellow" if isinstance(b,(int,float)) and b < 100 else "c-red") if isinstance(b,(int,float)) else "c-gray"
-                    gc = "c-green" if isinstance(g,(int,float)) and g < 100 else ("c-yellow" if isinstance(g,(int,float)) and g < 200 else "c-red") if isinstance(g,(int,float)) else "c-gray"
-                    # icon = NET_ICONS.get(h, "💻")
-                    loctxt = loc[:30] if loc else ""
-                    net_html += (f'<div class="np-card"><div class="np-head"><span class="np-dot {dot}"></span><span class="np-name">{esc(fn)}</span></div>'
-                                f'<div class="np-pings"><span class="np-ping"><span class="np-label">百度</span><span class="np-val {bc}">{bv}</span></span>'
-                                f'<span class="np-ping"><span class="np-label">YTB</span><span class="np-val {gc}">{gv}</span></span></div>'
-                                f'<div class="np-loc">{esc(loctxt)}</div></div>')
-                # 节点间延迟矩阵
-                all_nps = []
-                for h, n in ns.items():
-                    pings = (n.get("ping") or {}).get("node_pings", [])
-                    if pings:
-                        all_nps.extend(pings)
-                # Deduplicate by node name (each node reports its own view)
-                if all_nps:
-                    net_html += '<div class="node-lat-grid">'
-                    for np in all_nps:
-                        nm = esc(np["node"])
-                        ms = np["ms"]
-                        lc = "c-green" if ms < 1 else ("c-yellow" if ms < 5 else "c-red")
-                        net_html += f'<div class="nl-cell"><span class="nl-name">{nm}</span><span class="nl-ms {lc}">{ms:.2f}ms</span></div>'
-                    net_html += '</div>'
-                net_html += '</div></div>'
+                net_html += '</div>'
+                # 5×5 延迟矩阵
+                m_keys = list(ns.keys())
+                if m_keys:
+                    # Build matrix: source → target → ms
+                    matrix = {}
+                    def short_label(s): i=s.find(' '); return s[:i] if i>0 else s
+                    nn_map = NODE_NAMES
+                    # Build matrix keyed by short label (matches ping data)
+                    matrix = {}
+                    m_labels = []
+                    for h in m_keys:
+                        full = nn_map.get(h, h.split(".")[0] if "." in h else h)
+                        lb = short_label(full)
+                        m_labels.append(lb)
+                        n = ns[h]
+                        nps = (n.get("ping") or {}).get("node_pings", [])
+                        matrix[lb] = {}
+                        for np in nps:
+                            matrix[lb][np["node"]] = np["ms"]
+                    net_html += '<div class="net-toggle" onclick="toggleMatrix(this)"><span class="net-toggle-icon">▶</span>延迟矩阵 <span class="net-toggle-badge">5×5</span></div><div class="net-matrix-wrap open"><div class="node-lat-grid">'
+                    # Column headers
+                    net_html += '<div class="nl-cell col-header"></div>'
+                    for lb in m_labels:
+                        net_html += f'<div class="nl-cell col-header">{esc(lb)}</div>'
+                    # Data rows
+                    for si, sh in enumerate(m_keys):
+                        sdn = m_labels[si]
+                        net_html += f'<div class="nl-cell row-header">{esc(sdn)}</div>'
+                        for ti, th in enumerate(m_keys):
+                            tdn = m_labels[ti]
+                            if sdn == tdn:
+                                net_html += '<div class="nl-cell"><span class="nl-self">·</span></div>'
+                                continue
+                            mv = (matrix.get(sdn) or {}).get(tdn)
+                            if mv is not None:
+                                mc = "c-green" if mv < 0.5 else ("c-yellow" if mv < 3 else "c-red")
+                                bg = (f"rgba(34,197,94,{0.15+0.35*max(0,1-mv/0.5)})" if mv < 0.5
+                                      else "rgba(234,179,8,0.15)" if mv < 3
+                                      else "rgba(239,68,68,0.15)")
+                                net_html += f'<div class="nl-cell" style="background:{bg}"><span class="nl-ms {mc}">{mv:.2f}</span></div>'
+                            else:
+                                net_html += '<div class="nl-cell"><span class="nl-self">?</span></div>'
+                    # Legend
+                    net_html += '<div class="nl-legend"><span class="nl-legend-item"><span class="nl-dot" style="background:rgba(34,197,94,0.4)"></span>&lt;0.5ms</span><span class="nl-legend-item"><span class="nl-dot" style="background:rgba(234,179,8,0.4)"></span>0.5-3ms</span><span class="nl-legend-item"><span class="nl-dot" style="background:rgba(239,68,68,0.4)"></span>&gt;3ms</span></div>'
+                    net_html += '</div></div>'
+                net_html += '</div>'
                 dl_html = ""
                 total_files = 0
                 for h, n in ns.items():
@@ -1868,13 +1929,25 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .np-val.c-yellow{color:#fa0;text-shadow:0 0 6px #fa06}
 .np-val.c-red{color:#f44;text-shadow:0 0 6px #f46}
 .np-loc{font-size:6px;color:#334;margin-top:2px}
-.node-lat-grid{display:flex;flex-wrap:wrap;gap:3px;justify-content:center;margin-top:4px;padding-top:4px;border-top:1px solid rgba(26,26,58,.3)}
-.nl-cell{display:flex;align-items:center;gap:3px;background:rgba(10,10,26,.4);border:1px solid rgba(26,26,58,.2);border-radius:3px;padding:2px 4px}
-.nl-name{font-size:7px;color:#556}
-.nl-ms{font-size:9px;font-weight:bold;font-family:'Orbitron',sans-serif}
-.nl-ms.c-green{color:#0f0}
-.nl-ms.c-yellow{color:#fa0}
-.nl-ms.c-red{color:#f44}
+.node-lat-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:2px;margin-top:4px;padding-top:4px;max-height:170px;overflow-y:auto}
+.net-toggle{cursor:pointer;display:flex;align-items:center;gap:6px;padding:4px 6px;margin-top:4px;border-top:1px solid rgba(26,26,58,.3);font-size:9px;color:#556;user-select:none}
+.net-toggle:hover{color:#889;background:rgba(26,26,58,.1);border-radius:3px}
+.net-toggle-icon{font-size:7px;transition:transform .2s;display:inline-block}
+.net-toggle.open .net-toggle-icon{transform:rotate(90deg)}
+.net-toggle-badge{font-size:7px;color:#445;background:rgba(26,26,58,.3);padding:1px 4px;border-radius:2px;margin-left:auto}
+.net-matrix-wrap{display:none}
+.net-matrix-wrap.open{display:block}
+.nl-cell{text-align:center;background:rgba(10,10,26,.4);border:1px solid rgba(26,26,58,.2);border-radius:3px;padding:2px 0;font-size:9px;font-family:'Orbitron',sans-serif;min-height:22px;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.nl-cell.col-header{background:transparent;border:none;color:#556;font-size:7px;font-family:inherit;min-height:auto}
+.nl-cell.row-header{background:transparent;border:none;color:#889;font-size:7px;font-family:inherit;min-height:auto}
+.nl-ms{font-weight:bold;font-size:9px}
+.nl-ms.c-green{color:#0f0;text-shadow:0 0 4px #0f04}
+.nl-ms.c-yellow{color:#fa0;text-shadow:0 0 4px #fa04}
+.nl-ms.c-red{color:#f44;text-shadow:0 0 4px #f44}
+.nl-self{color:#334;font-size:7px}
+.nl-legend{display:flex;gap:10px;justify-content:center;margin-top:4px;font-size:7px;color:#556;font-family:inherit}
+.nl-legend-item{display:flex;align-items:center;gap:3px}
+.nl-dot{width:6px;height:6px;border-radius:50%;display:inline-block}
 .footer{text-align:center;color:#224;font-size:9px;margin-top:10px}
 .footer a{color:#448;text-decoration:none}
 @media(max-width:600px){.grid{grid-template-columns:1fr}.header h1{font-size:16px}}
@@ -2101,10 +2174,17 @@ htm+='<div style="width:100%;display:flex;gap:6px;justify-content:center;margin-
 '<div style="text-align:center"><div style="font-size:6px;color:#556">TEMP \u00b0</div>'+renderSparkline(temps,'#f60',28)+'</div>'+
 '<div style="text-align:center"><div style="font-size:6px;color:#556">PWR W</div>'+renderSparkline(powers,'#fa0',28)+'</div></div>';}}}
 if(s.gpu_info)htm+='<div style="width:100%;text-align:center;margin-top:2px"><span class="gpu-tag" title="'+esc(s.gpu_info)+'">'+esc(s.gpu_info.substring(0,30))+'</span></div>';
-if(s.gpu_clk_graphics!==undefined)htm+='<span class="gpu-clk">⚡ '+esc(s.gpu_clk_graphics)+'MHz 💾 '+esc(s.gpu_clk_memory)+'MHz</span>';
+if(s.gpu_clk_graphics!==undefined&&s.gpu_clk_memory!==undefined)htm+='<span class="gpu-clk">⚡ '+esc(s.gpu_clk_graphics)+'MHz 💾 '+esc(s.gpu_clk_memory)+'MHz</span>';
 if(s.fan_rpm_avg!==undefined)htm+='<span class="fan-speed">❄ '+esc(s.fan_rpm_avg)+' RPM</span>';
 if(s.load)htm+='<div style="width:100%;text-align:center"><span class="sys-load">LD: '+esc(s.load)+'</span></div>';
 if(s.uptime)htm+='<div style="width:100%;text-align:center"><span class="sys-up">'+esc(s.uptime)+'</span></div>';
+// Public ping info (embedded from NETWORK LINKS)
+var p=n.ping||{};var b=p.baidu_ms,g=p.ytb_ms,loc=p.public_loc||'';
+if(b!==undefined||g!==undefined||loc){htm+='<div style="width:100%;text-align:center;margin-top:3px;font-size:8px">';
+if(b!==undefined)htm+='<span style="color:#4ade80">🌐 百度 '+Math.round(b)+'ms</span>';
+if(g!==undefined)htm+='<span style="color:'+(g<200?'#4ade80':'#facc15')+'"> YTB '+Math.round(g)+'ms</span>';
+if(loc)htm+='<span style="color:#94a3b8;margin-left:6px">📍 '+esc(loc.slice(0,25))+'</span>';
+htm+='</div>';}
 htm+='</div></div>';return htm;}
 function dlCard(h,n){var f=n.active_files||[];var nn=typeof NODE_NAMES!='undefined'?NODE_NAMES:{};var fn=nn[h]||(h.indexOf('.')>=0?h.split('.')[0]:h);
 var dots=n.tracked_total>0||(n.ts||0)>1700000000;var dc=dots?'online':'offline';
@@ -2117,17 +2197,26 @@ htm+='</div>';return htm;}
 function netCard(c){var ns=c.nodes||{};var lk=c.network||{};var l200=lk.link200||{};var lkc=l200.up?'#0f0':'#f44';var lkt=l200.latency?l200.latency.toFixed(2)+'ms':(l200.up===false?'DOWN':'...');
 var htm='<div class="card net-card"><div class="net-top"><div class="net-200g"><span class="net-200g-icon">\u26a1</span><span class="net-200g-label">200G</span><span class="net-200g-nodes">'+esc(l200.link200_nodes||'spark-9051 ↔ spark-9797')+'</span><span class="net-200g-lat" style="color:'+lkc+'">'+lkt+'</span></div>';
 var tbs=lk.tb||[];tbs.forEach(function(tb){htm+='<div class="net-tb-link">\U0001f5e1 '+esc(tb.from)+' \u2194 '+esc(tb.to)+' <span class="net-tb-speed">'+esc(tb.speed)+'</span></div>';});
-htm+='</div><div class="net-ping-grid">';var nn=typeof NODE_NAMES!='undefined'?NODE_NAMES:{};
-var keys=Object.keys(ns);for(var i=0;i<keys.length;i++){var h=keys[i];var n=ns[h];var p=n.ping||{};var b=p.baidu_ms;var g=p.ytb_ms;var fn=nn[h]||(h.indexOf('.')>=0?h.split('.')[0]:h);
-var loc=p.public_loc||'';var dot=typeof b==='number'?'s-green':'s-gray';
-var bv=typeof b==='number'?Math.round(b):'?';var gv=typeof g==='number'?Math.round(g):'?';
-var bc=typeof b==='number'?(b<50?'c-green':b<100?'c-yellow':'c-red'):'c-gray';
-var gc=typeof g==='number'?(g<100?'c-green':g<200?'c-yellow':'c-red'):'c-gray';
-htm+='<div class="np-card"><div class="np-head"><span class="np-dot '+dot+'"></span><span class="np-name">'+esc(fn)+'</span></div><div class="np-pings"><span class="np-ping"><span class="np-label">\u767e\u5ea6</span><span class="np-val '+bc+'">'+bv+'</span></span><span class="np-ping"><span class="np-label">YTB</span><span class="np-val '+gc+'">'+gv+'</span></span></div><div class="np-loc">'+esc(loc.slice(0,30))+'</div></div>';}
-// Node latency matrix
-htm+='<div class="node-lat-grid">';for(var hi=0;hi<keys.length;hi++){var hk=keys[hi];var nk=ns[hk];var nps=(nk.ping||{}).node_pings||[];for(var ni=0;ni<nps.length;ni++){var np=nps[ni];var nlc=np.ms<1?'c-green':np.ms<5?'c-yellow':'c-red';htm+='<div class="nl-cell"><span class="nl-name">'+esc(np.node)+'</span><span class="nl-ms '+nlc+'">'+np.ms.toFixed(2)+'ms</span></div>';}}
-htm+='</div></div>';return htm;}
-// Theme switching
+htm+='</div>';var nn=typeof NODE_NAMES!='undefined'?NODE_NAMES:{};
+// Build 5x5 latency matrix (keyed by short label)
+function sl(l){var i=l.indexOf(' ');return i>0?l.substring(0,i):l}
+var mKeys=Object.keys(ns);var mLabels={};for(var mi=0;mi<mKeys.length;mi++){var full=nn[mKeys[mi]]||mKeys[mi].split('.')[0];mLabels[mKeys[mi]]=sl(full)}
+var matrix={};for(var mi=0;mi<mKeys.length;mi++){var sk=mKeys[mi];var sn=ns[sk];var nps=(sn.ping||{}).node_pings||[];var rl=mLabels[sk];matrix[rl]={};for(var mj=0;mj<nps.length;mj++){matrix[rl][nps[mj].node]=nps[mj].ms}}
+htm+='<div class="net-toggle" onclick="toggleMatrix(this)"><span class="net-toggle-icon">▶</span>延迟矩阵 <span class="net-toggle-badge">5×5</span></div><div class="net-matrix-wrap open"><div class="node-lat-grid">';
+// Column headers: empty top-left + node names
+htm+='<div class="nl-cell col-header"></div>';for(var ci=0;ci<mKeys.length;ci++){htm+='<div class="nl-cell col-header">'+esc(mLabels[mKeys[ci]])+'</div>'}
+// Data rows (keyed by short label, matches ping data)
+for(var ri=0;ri<mKeys.length;ri++){var rl=mLabels[mKeys[ri]];htm+='<div class="nl-cell row-header">'+esc(rl)+'</div>';
+  for(var ci=0;ci<mKeys.length;ci++){var cl=mLabels[mKeys[ci]];
+    if(rl===cl){htm+='<div class="nl-cell"><span class="nl-self">·</span></div>'}
+    else{var mv=matrix[rl]?matrix[rl][cl]:undefined;
+      if(typeof mv==='number'){var mc=mv<0.5?'c-green':mv<3?'c-yellow':'c-red';var bg=mv<0.5?'rgba(34,197,94,'+(0.15+0.35*Math.max(0,1-mv/0.5))+')':mv<3?'rgba(234,179,8,0.15)':'rgba(239,68,68,0.15)';htm+='<div class="nl-cell" style="background:'+bg+'"><span class="nl-ms '+mc+'">'+mv.toFixed(2)+'</span></div>'}
+      else{htm+='<div class="nl-cell"><span class="nl-self">?</span></div>'}}}
+}
+htm+='<div class="nl-legend"><span class="nl-legend-item"><span class="nl-dot" style="background:rgba(34,197,94,0.4)"></span>&lt;0.5ms</span><span class="nl-legend-item"><span class="nl-dot" style="background:rgba(234,179,8,0.4)"></span>0.5-3ms</span><span class="nl-legend-item"><span class="nl-dot" style="background:rgba(239,68,68,0.4)"></span>&gt;3ms</span></div>'
+htm+='</div></div></div>';return htm;}
+// Toggle latency matrix
+function toggleMatrix(el){el.classList.toggle('open');var w=el.nextElementSibling;if(w)w.classList.toggle('open')}
 function switchTheme(t){localStorage.setItem('dltrace-theme',t);document.body.className='theme-'+t;document.querySelectorAll('.theme-btn,.stheme-btn').forEach(function(b){b.classList.toggle('active',b.dataset.theme===t)})}
 function applyTheme(t){switchTheme(t)}
 function navTo(el,id){document.getElementById(id).scrollIntoView({behavior:'smooth'});document.querySelectorAll('.nav-item.active').forEach(function(e){e.classList.remove('active')});el.classList.add('active')}
