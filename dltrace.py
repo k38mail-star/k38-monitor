@@ -29,6 +29,38 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+
+# ── 动态节点配置 ──────────────────────────────────────────────
+def _load_node_config(hardcoded: dict) -> dict:
+    """
+    加载HTTP拉取的远程节点配置。
+    优先级: 环境变量 DLTRACE_NODES > ~/.dltrace_nodes.json > hardcoded
+    环境变量格式: JSON字符串 e.g. '{"三万八":"http://...",...}'
+    """
+    # 1. 环境变量
+    env_val = os.environ.get("DLTRACE_NODES")
+    if env_val:
+        try:
+            parsed = json.loads(env_val)
+            if isinstance(parsed, dict) and len(parsed) > 0:
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # 2. 配置文件
+    config_path = os.path.expanduser("~/.dltrace_nodes.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path) as f:
+                parsed = json.load(f)
+            if isinstance(parsed, dict) and len(parsed) > 0:
+                return parsed
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 3. 硬编码默认值
+    return dict(hardcoded)
+
 import socketserver
 
 # 🔒 禁用__pycache__字节码缓存 (根因: pyc缓存导致代码更新后仍跑旧版本)
@@ -66,6 +98,8 @@ MAX_PROCESSES     = 10
 HISTORY_LEN       = 60
 HISTORY_SAVE_SEC  = 300   # 历史文件最长保留5分钟
 LOG_MAX_SIZE      = 1_000_000
+GPU_TREND  = {}          # GPU趋势缓存, keyed by node_key
+MAX_TREND  = 12          # GPU趋势最大样本数
 
 # ── 速度窗口 ──
 SPEED_WINDOW_SEC  = 60
@@ -92,7 +126,8 @@ SKIP_PATH_PATTERNS = [r"/\.git/", r"/miniforge3/", r"/anaconda3/", r"/snap/"]
 # 传给面板的字段白名单(增改字段只改这里)
 NODE_FIELDS = ["hostname", "ts_str", "active_files", "active_procs",
                "files_count", "procs_count", "tracked_total", "ts",
-               "version", "system", "ping", "history", "network", "jobs"]
+               "version", "system", "ping", "history", "network", "jobs",
+               "docker", "diskio"]
 
 # 下载工具进程匹配
 DL_TOOL_PATTERNS = {
@@ -581,6 +616,72 @@ class DownloadTracker:
 
         return jobs[:10]
 
+    def _collect_docker(self) -> dict:
+        """采集Docker容器状态."""
+        out = {"containers": [], "summary": ""}
+        try:
+            r = subprocess.run(["docker", "ps", "-a", "--format", "{{.ID}}|{{.Image}}|{{.Status}}|{{.Names}}"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode != 0:
+                return out
+            containers = []
+            for line in r.stdout.strip().split("\n"):
+                if not line.strip():
+                    continue
+                parts = line.split("|", 3)
+                if len(parts) < 4:
+                    continue
+                cid, image, status, name = parts[0][:12], parts[1], parts[2], parts[3]
+                running = "Up" in status or status.lower().startswith("up")
+                containers.append({
+                    "id": cid, "image": image[:40], "name": name,
+                    "status": status[:60], "state": "running" if running else "stopped"
+                })
+            out["containers"] = containers
+            run_c = sum(1 for c in containers if c["state"] == "running")
+            stop_c = len(containers) - run_c
+            out["summary"] = (f"{run_c} running" if run_c else "") + \
+                (f", {stop_c} stopped" if stop_c else "") if containers else "no containers"
+        except (OSError, subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        return out
+
+    def _collect_disk_io(self) -> list[dict]:
+        """采集磁盘IO吞吐量."""
+        out = []
+        try:
+            if sys.platform == "darwin":
+                r = subprocess.run(["iostat"], capture_output=True, text=True, timeout=5)
+                lines = r.stdout.strip().split("\n")
+                if len(lines) >= 3:
+                    parts = lines[2].split()
+                    # macOS iostat: 每个disk 4列(KB_t tps MB/s), 再+2列(cpu) + 3列(load)
+                    # parts[0]=KB_t_0, [1]=tps_0, [2]=MB_s_0, [3]=KB_t_1, [4]=tps_1, [5]=MB_s_1
+                    # name由header行提供: disk0, disk4
+                    # header行: [disk0, disk4, cpu, load, average]
+                    hdr = lines[0].split()
+                    disk_names = [hdr[i] for i in range(len(hdr)) if hdr[i].startswith("disk")]
+                    for di, name in enumerate(disk_names):
+                        base = di * 4
+                        if base + 2 < len(parts):
+                            # macOS iostat 不区分读写, 用 kb_t * tps 算读速率, 写设为 0
+                            kb_t = float(parts[base])
+                            tps = float(parts[base + 1])
+                            out.append({"device": name,
+                                        "kb_read": round(kb_t * tps, 1),
+                                        "kb_write": 0})
+            else:
+                r = subprocess.run(["iostat", "-x", "1", "2"], capture_output=True, text=True, timeout=5)
+                for line in r.stdout.strip().split("\n"):
+                    parts = line.split()
+                    if len(parts) >= 12 and (parts[0].startswith("sd") or parts[0].startswith("nvme")):
+                        out.append({"device": parts[0],
+                                    "kb_read": float(parts[5]) / 2 if len(parts) > 5 else 0,
+                                    "kb_write": float(parts[9]) / 2 if len(parts) > 9 else 0})
+        except (OSError, subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        return out
+
     def _collect_system_info(self) -> dict:
         """收集系统信息: CPU/内存/磁盘/GPU(跨平台Mac+Linux)"""
         info: dict = {}
@@ -889,6 +990,18 @@ class DownloadTracker:
             if v is not None:
                 with self._history_lock:
                     self._history[k].append((now, float(v)))
+        # GPU趋势: 从系统信息收集GPU温度/功耗序列
+        node_key = os.uname().nodename
+        gpu_temp_val = si.get("gpu_temp")
+        gpu_power_val = si.get("gpu_power")
+        if gpu_temp_val is not None or gpu_power_val is not None:
+            if node_key not in GPU_TREND:
+                GPU_TREND[node_key] = deque(maxlen=MAX_TREND)
+            GPU_TREND[node_key].append({
+                "temp": round(gpu_temp_val if gpu_temp_val is not None else 0, 1),
+                "power": round(gpu_power_val if gpu_power_val is not None else 0, 1),
+            })
+
         # 线程安全获取历史快照
         hist_snap = {}
         if self._history_lock.acquire(blocking=False):
@@ -896,6 +1009,10 @@ class DownloadTracker:
                 hist_snap = {k: list(v) for k, v in self._history.items()}
             finally:
                 self._history_lock.release()
+
+        gpu_trends_data = {}
+        for k, v in GPU_TREND.items():
+            gpu_trends_data[k] = list(v)
 
         report = {
             "version": __version__,
@@ -908,6 +1025,9 @@ class DownloadTracker:
             "procs_count": len(active_procs),
             "tracked_total": len(self.trackers),
             "system": si,
+            "gpu_trends": gpu_trends_data,
+            "docker": self._collect_docker(),
+            "diskio": self._collect_disk_io(),
             "ping": dict(self.__class__._ping_cache),
             "history": hist_snap,
             "network": self._collect_network(),
@@ -1126,32 +1246,27 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                                         "active_files": [], "active_procs": [],
                                         "files_count": 0, "procs_count": 0}
 
-            # 收集所有远程目标
-            targets = []
-            if self._ssh_target:
-                targets.append(("primary", self._ssh_target))
-            for node in self._extra_nodes:
-                targets.append(("extra", node))
-
-            if not targets:
-                if not nodes:
-                    nodes["localhost"] = {"hostname": "localhost", "ts_str": "--:--:--",
-                                            "active_files": [], "active_procs": [],
-                                            "files_count": 0, "procs_count": 0}
-                return nodes
-
-            # 并行SSH读取(每个节点独立线程 + 3秒超时)
-            with ThreadPoolExecutor(max_workers=len(targets)) as pool:
-                futures = {pool.submit(_read_remote_data, t[1], self._progress_file): t for t in targets}
-                for future in as_completed(futures, timeout=SSH_TIMEOUT + 2):
-                    try:
-                        node_data = future.result(timeout=SSH_TIMEOUT)
-                        if node_data:
-                            node_key = futures[future][1].split("@")[-1] if "@" in futures[future][1] else futures[future][1]
-                            if node_key not in nodes:
-                                nodes[node_key] = node_data
-                    except Exception:
-                        pass  # 单节点超时不影响其他
+            # 已知所有节点的HTTP API（支持动态配置）
+            KNOWN_NODES = _load_node_config(
+                hardcoded={
+                    "三万八":    "http://192.168.3.29:8899/api/v1/metrics",
+                    "小四":      "http://192.168.3.46:8899/api/v1/metrics",
+                    "大傻":      "http://192.168.3.55:8899/api/v1/metrics",
+                    "二傻":      "http://192.168.3.45:8899/api/v1/metrics",
+                }
+            )
+            # 并行HTTP拉取(兼容旧数据格式)
+            def _pull_node(name, url):
+                try:
+                    import urllib.request
+                    r = urllib.request.urlopen(url, timeout=3)
+                    return name, json.loads(r.read().decode())
+                except Exception:
+                    return name, {}
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for name, nd in pool.map(lambda kv: _pull_node(*kv), KNOWN_NODES.items()):
+                    if nd and name not in nodes:
+                        nodes[name] = nd
 
             if not nodes:
                 nodes["localhost"] = {"hostname": "localhost", "ts_str": "--:--:--",
@@ -1166,9 +1281,25 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
             nodes_clean = {}
             for h, nd in nodes.items():
                 sys_info = nd.get("system", {}) or {}
-                nodes_clean[h] = {f: nd.get(f) for f in NODE_FIELDS}
-                nodes_clean[h]["hostname"] = nd.get("hostname", h)
-                nodes_clean[h]["system"] = sys_info
+                entry = {f: nd.get(f) for f in NODE_FIELDS}
+                entry["hostname"] = nd.get("hostname", h)
+                entry["system"] = sys_info
+                # 标准化docker: 统一为 dict {containers:[], summary:""}
+                dk = entry.get("docker")
+                if dk is None or (isinstance(dk, list) and len(dk) == 0):
+                    entry["docker"] = {"containers": [], "summary": ""}
+                elif isinstance(dk, list):
+                    entry["docker"] = {"containers": dk, "summary": f"{len(dk)} containers"}
+                elif isinstance(dk, dict):
+                    if "containers" not in dk:
+                        entry["docker"] = {"containers": [], "summary": ""}
+                # 标准化diskio: 统一为 list[dict]
+                dio = entry.get("diskio")
+                if dio is None or (isinstance(dio, dict) and not dio.get("partitions")):
+                    entry["diskio"] = []
+                elif isinstance(dio, dict) and dio.get("partitions"):
+                    entry["diskio"] = dio["partitions"]
+                nodes_clean[h] = entry
             # 返回第一个节点的数据(兼容老API), 附加网络信息
             for hostname, data in nodes.items():
                 data["nodes"] = nodes_clean  # 用无循环引用的副本
@@ -1391,6 +1522,13 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
     return Handler
 
 
+def _fmt_size(mb):
+    """MB to human readable: if >=1024 show GB."""
+    if mb >= 1024:
+        return f"{mb/1024:.1f}GB"
+    return f"{mb:.0f}MB"
+
+
 def _get_dashboard_html() -> str:
     """返回HTML模板(工业风)"""
     return r"""<!DOCTYPE html><html lang="zh"><head>
@@ -1404,8 +1542,8 @@ def _get_dashboard_html() -> str:
 body{font-family:'JetBrains Mono',monospace;overflow-x:hidden;background:#050510;color:#aab}
 canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.35;pointer-events:none}
 .scanline{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.03) 2px,rgba(0,0,0,.03) 4px)}
-#app{position:relative;z-index:1;max-width:1320px;margin:0 auto;padding:12px}
-.header{text-align:center;padding:8px 0 4px}
+#app{position:relative;z-index:1;max-width:1340px;margin:0 auto;padding:12px;margin-left:160px}
+.header{text-align:center;padding:4px 0 0}
 .header h1{font-family:'Orbitron',sans-serif;font-size:22px;color:#0ff;letter-spacing:4px;text-shadow:0 0 20px #0ff6}
 .header .sub{font-size:10px;color:#334;letter-spacing:2px;margin-top:2px}
 .topbar{display:flex;justify-content:space-between;align-items:center;padding:2px 0;font-size:9px;color:#445;border-bottom:1px solid #12122a;margin-bottom:6px}
@@ -1414,7 +1552,8 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .theme-btn:hover{color:#aab;border-color:#3a3a5a}
 .theme-btn.active{color:#0ff;border-color:#0ff;text-shadow:0 0 6px #0ff4;background:rgba(0,255,255,.05)}
 .status-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;vertical-align:middle}
-.status-dot.online{background:#0f0;box-shadow:0 0 4px #0f0}
+.status-dot.online{background:#0f0;box-shadow:0 0 4px #0f0;animation:pulse-dot 2s ease-in-out infinite}
+@keyframes pulse-dot{0%,100%{opacity:1;box-shadow:0 0 6px #0f0}50%{opacity:0.65;box-shadow:0 0 14px #0f0}}
 .status-dot.offline{background:#f44;box-shadow:0 0 4px #f44}
 .section-label{font-family:'Orbitron',sans-serif;font-size:11px;letter-spacing:3px;margin:10px 0 6px;padding-bottom:2px;text-shadow:0 0 8px #0ff4}
 .section-label .icon{margin-right:6px}
@@ -1536,10 +1675,84 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .theme-netdata .net-card{padding:8px 12px}
 .theme-netdata .net-row{font-size:10px;justify-content:flex-start;gap:12px}
 .theme-netdata .net-link{font-size:8px}
+/* Sidebar - glassmorphism redesign */
+.sidebar{position:fixed;left:0;top:0;width:160px;height:100vh;background:linear-gradient(180deg,rgba(8,12,24,0.92),rgba(12,18,32,0.88) 60%,rgba(6,10,20,0.94));backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-right:1px solid rgba(0,255,255,0.08);box-shadow:2px 0 30px rgba(0,0,0,0.5),inset -1px 0 0 rgba(0,255,255,0.04);z-index:100;display:flex;flex-direction:column;padding:0;transition:width 0.3s ease,box-shadow 0.3s}
+.sidebar:hover{width:180px;box-shadow:4px 0 40px rgba(0,0,0,0.6),inset -1px 0 0 rgba(0,255,255,0.08)}
+.sidebar-title{text-align:center;color:#0ff;font-size:11px;letter-spacing:4px;padding:14px 10px 10px;border-bottom:1px solid rgba(0,255,255,0.08);font-family:'Orbitron',sans-serif;text-shadow:0 0 15px rgba(0,255,255,0.2);position:relative}
+.sidebar-title::after{content:'';position:absolute;bottom:-1px;left:10%;width:80%;height:1px;background:linear-gradient(90deg,transparent,rgba(0,255,255,0.2),transparent)}
+.sidebar-nav{flex:1;overflow-y:auto;padding:6px 0;position:relative}
+.nav-item{display:flex;align-items:center;padding:8px 12px;color:#445;font-size:10px;cursor:pointer;transition:all 0.25s cubic-bezier(0.4,0,0.2,1);border-left:2px solid transparent;letter-spacing:1px;margin:1px 6px;border-radius:0 4px 4px 0;position:relative;overflow:hidden}
+.nav-item::before{content:'';position:absolute;left:0;top:0;width:100%;height:100%;background:linear-gradient(90deg,rgba(0,255,255,0.06),transparent 60%);opacity:0;transition:opacity 0.3s;pointer-events:none}
+.nav-item:hover{color:#0ff;border-left-color:#0ff;background:rgba(0,255,255,0.06);text-shadow:0 0 8px rgba(0,255,255,0.3)}
+.nav-item:hover::before{opacity:1}
+.nav-item.active{color:#0ff;border-left-color:#0ff;background:rgba(0,255,255,0.08);text-shadow:0 0 10px rgba(0,255,255,0.4);box-shadow:inset 0 0 20px rgba(0,255,255,0.04),0 0 10px rgba(0,255,255,0.05);animation:nav-glow 3s ease-in-out infinite}
+@keyframes nav-glow{0%,100%{box-shadow:inset 0 0 20px rgba(0,255,255,0.04),0 0 10px rgba(0,255,255,0.05)}50%{box-shadow:inset 0 0 20px rgba(0,255,255,0.08),0 0 16px rgba(0,255,255,0.08)}}
+.sidebar-bottom{margin-top:auto;padding:10px 8px}
+/* Theme switch in sidebar */
+.stheme-switch{display:flex;gap:4px;padding:2px;border-radius:5px;background:rgba(0,255,255,0.03);border:1px solid rgba(0,255,255,0.05)}
+.stheme-btn{flex:1;padding:5px 0;font-size:8px;background:transparent;border:none;color:#445;cursor:pointer;border-radius:3px;text-align:center;font-family:'Orbitron',sans-serif;letter-spacing:1px;transition:all 0.25s cubic-bezier(0.4,0,0.2,1);position:relative}
+.stheme-btn:hover{color:#889}
+.stheme-btn.active{color:#0ff;background:rgba(0,255,255,0.1);box-shadow:0 0 12px rgba(0,255,255,0.1);text-shadow:0 0 8px #0ff4}
+/* Netdata sidebar */
+body.theme-netdata .sidebar{background:linear-gradient(180deg,rgba(24,12,8,0.92),rgba(28,16,10,0.88) 60%,rgba(20,10,6,0.94));backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-right-color:rgba(255,160,0,0.08);box-shadow:2px 0 30px rgba(0,0,0,0.5),inset -1px 0 0 rgba(255,160,0,0.04)}
+body.theme-netdata .sidebar:hover{box-shadow:4px 0 40px rgba(0,0,0,0.6),inset -1px 0 0 rgba(255,160,0,0.08)}
+body.theme-netdata .sidebar-title{color:#fa0;border-bottom-color:rgba(255,160,0,0.08);text-shadow:0 0 15px rgba(255,160,0,0.2)}
+body.theme-netdata .sidebar-title::after{background:linear-gradient(90deg,transparent,rgba(255,160,0,0.2),transparent)}
+body.theme-netdata .nav-item{color:#654}
+body.theme-netdata .nav-item::before{background:linear-gradient(90deg,rgba(255,160,0,0.06),transparent 60%)}
+body.theme-netdata .nav-item:hover{color:#fa0;border-left-color:#fa0;background:rgba(255,160,0,0.06);text-shadow:0 0 8px rgba(255,160,0,0.3)}
+body.theme-netdata .nav-item.active{color:#fa0;border-left-color:#fa0;background:rgba(255,160,0,0.08);text-shadow:0 0 10px rgba(255,160,0,0.4);box-shadow:inset 0 0 20px rgba(255,160,0,0.04),0 0 10px rgba(255,160,0,0.05);animation:nav-glow-nd 3s ease-in-out infinite}
+@keyframes nav-glow-nd{0%,100%{box-shadow:inset 0 0 20px rgba(255,160,0,0.04),0 0 10px rgba(255,160,0,0.05)}50%{box-shadow:inset 0 0 20px rgba(255,160,0,0.08),0 0 16px rgba(255,160,0,0.08)}}
+body.theme-netdata .stheme-switch{background:rgba(255,160,0,0.03);border-color:rgba(255,160,0,0.05)}
+body.theme-netdata .stheme-btn{color:#654}
+body.theme-netdata .stheme-btn.active{color:#fa0;background:rgba(255,160,0,0.1);box-shadow:0 0 12px rgba(255,160,0,0.1);text-shadow:0 0 8px #fa04}
+/* Topo */
+.topo-map{padding:6px 6px;border-bottom:1px solid rgba(0,255,255,0.06);margin-bottom:6px}
+.topo-row{display:flex;justify-content:center;gap:14px;margin:1px 0}
+.topo-node{width:8px;height:8px;border-radius:50%;margin:0 auto;transition:all 0.3s}
+.topo-line{width:2px;height:8px;background:rgba(0,255,255,0.08);margin:0 auto}
+.topo-ceo{background:#fd0;box-shadow:0 0 5px #fd0}
+.topo-coo{background:#0ff;box-shadow:0 0 5px #0ff}
+.topo-cto{background:#f0f;box-shadow:0 0 5px #f0f}
+.topo-dgx{background:#0f0;box-shadow:0 0 5px #0f0}
+body.theme-netdata .topo-map{border-bottom-color:rgba(255,160,0,0.06)}
+body.theme-netdata .topo-line{background:rgba(255,160,0,0.08)}
+body.theme-netdata .sidebar-nav .nav-item{margin:1px 4px}
 </style>
 </head><body>
 <canvas id="bg"></canvas><div class="scanline"></div>
 <div id="app">
+<div class="sidebar">
+<div class="sidebar-title">▣ K38</div>
+<div class="sidebar-nav">
+<div class="nav-item" onclick="navTo('sys-grid');this.classList.add('active')">MONITOR</div>
+<div class="nav-item" onclick="navTo('job-grid');this.classList.add('active')">JOBS</div>
+<div class="nav-item" onclick="navTo('net-section');this.classList.add('active')">NET</div>
+<div class="nav-item" onclick="navTo('dl-grid');this.classList.add('active')">DL</div>
+<div class="nav-item" onclick="navTo('svc-grid');this.classList.add('active')">SVC</div>
+<div class="nav-item" onclick="navTo('docker-grid');this.classList.add('active')">DOCK</div>
+<div class="nav-item" onclick="navTo('diskio-grid');this.classList.add('active')">DISK</div>
+</div>
+<div class="sidebar-bottom">
+<div class="topo-map">
+<div class="topo-row"><div class="topo-node topo-ceo" title="十六万"></div></div>
+<div class="topo-line"></div>
+<div class="topo-row">
+<div class="topo-node topo-coo" title="三万八"></div>
+<div class="topo-node topo-cto" title="小四"></div>
+</div>
+<div class="topo-line"></div>
+<div class="topo-row">
+<div class="topo-node topo-dgx" title="大傻"></div>
+<div class="topo-node topo-dgx" title="二傻"></div>
+</div>
+</div>
+<div class="stheme-switch">
+<span class="stheme-btn active" data-theme="s360" onclick="switchTheme('s360')">S360</span>
+<span class="stheme-btn" data-theme="netdata" onclick="switchTheme('netdata')">ND</span>
+</div>
+</div>
+</div>
 <div class="header"><h1>▣ K38 MONITOR</h1><div class="sub">CLUSTER DASHBOARD · v0.3.0</div></div>
 <div class="topbar">
 <div class="theme-switch">
@@ -1556,6 +1769,10 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 <div class="grid" id="dl-grid">{{DL_HTML}}</div>
 <div class="section-label job-label"><span class="icon">&#x23f3;</span> CONTENT PRODUCTION</div>
 <div class="grid" id="job-grid">{{JOB_HTML}}</div>
+<div class="section-label" style="font-size:11px;letter-spacing:3px;margin:10px 0 6px;color:#0f8;font-family:'Orbitron',sans-serif">&#x1f4ca; DISK I/O</div>
+<div class="grid" id="diskio-grid"></div>
+<div class="section-label" style="font-size:11px;letter-spacing:3px;margin:10px 0 6px;color:#0ff;font-family:'Orbitron',sans-serif">&#x1f433; DOCKER CONTAINERS</div>
+<div class="grid" id="docker-grid"></div>
 <div class="footer"><a href="https://github.com/kk38/dltrace" target="_blank">dltrace</a> · {{VERSION}} · {{TS}}</div>
 </div>
 <script>
@@ -1565,6 +1782,9 @@ function esc(s){if(s==null)return'';var d=document.createElement('div');d.append
 function pctCls(p){return p>=100?'pct-ok':p>50?'pct-mid':'pct-low'}
 function barCls(s){return s==='done'||s==='stale'?'dl-done':s==='finishing'?'dl-finish':'dl-down'}
 function tagIcon(t){var tl=(t||'').toLowerCase();if(tl.match(/model|qwen|llm|safetensors/))return'\uD83E\uDDE0';if(tl.match(/archive|tar|gz|zip/))return'\uD83D\uDDDC\uFE0F';if(tl.match(/git|clone/))return'\uD83D\uDD00';if(tl.match(/pip|python/))return'\uD83D\uDC0D';if(tl.match(/docker|image/))return'\uD83D\uDC33';if(tl.match(/video|mp4|movie/))return'\uD83C\uDFAC';return'\uD83D\uDCC4'}
+function fmtSize(mb){if(mb>=1024)return(mb/1024).toFixed(1)+'GB';return Math.round(mb)+'MB'}
+function fmtKb(kb){if(kb>=1024)return(kb/1024).toFixed(1)+'MB/s';return Math.round(kb)+'KB/s'}
+function renderSparkline(vals,color,h){if(!vals||vals.length<2)return'';var mx=Math.max.apply(null,vals),mn=Math.min.apply(null,vals);var rng=mx-mn||1,bw=Math.max(3,Math.min(6,80/vals.length));var bars=vals.map(function(v){var p=Math.max(5,Math.min(100,(v-mn)/rng*100));return'<div style="width:'+bw+'px;height:'+p+'%;background:'+color+';border-radius:1px;opacity:0.5"></div>';}).join('');return'<div style="display:flex;align-items:flex-end;gap:1px;height:'+h+'px;margin-top:3px">'+bars+'</div>';}
 function sparkline(data,color,w,h){if(!data||data.length<3)return'';var vals=[],i;for(i=0;i<data.length;i++)vals.push(data[i][1]);var vmin=Math.min.apply(null,vals),vmax=Math.max.apply(null,vals);if(vmax-vmin<.1){vmin-=1;vmax+=1}var rng=vmax-vmin;var pts='';for(i=0;i<vals.length;i++){pts+=(i/(vals.length-1)*w).toFixed(1)+','+(h-(vals[i]-vmin)/rng*(h-4)-2).toFixed(1)+' '}
 var gid='sg_'+Math.abs(Math.floor(Math.random()*99999));return'<svg class="sparkline" width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'"><defs><linearGradient id="'+gid+'" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="'+color+'" stop-opacity="0.3"/><stop offset="100%" stop-color="'+color+'" stop-opacity="0.02"/></linearGradient></defs><polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><polygon points="0,'+h+' '+pts+' '+w+','+h+'" fill="url(#'+gid+')"/></svg>';}
 function gauge(id,n,v,u,cl){var isT=n=='TMP'||n=='TMG'||n=='TMC';var c=cl||(isT?(v>75?'#f44':v>55?'#fa0':'#0f8'):(v>90?'#f44':v>70?'#fa0':'#0ff'));var p=Math.min(Math.max(v,0),100);var r=22,sw=5,cx=r+sw,cy=r+sw,sz=cx*2,circ=2*Math.PI*r,dash=circ*p/100;
@@ -1582,10 +1802,16 @@ var htm='<div class="card sys-card" style="border-top:2px solid '+(dots?'#0ff':'
 if(s.cpu_pct!==undefined)htm+=gauge('cpu_'+h,'CPU',s.cpu_pct,'%');else if(s.load_1m!==undefined)htm+=gauge('cpu_'+h,'LD',s.load_1m,'');
 if(s.mem_pct!==undefined)htm+=gauge('mem_'+h,'MEM',s.mem_pct,'%');
 if(s.gpu_pct!==undefined)htm+=gauge('gpu_'+h,'GPU',s.gpu_pct,'%');
+if(s.gpu_mem_used!==undefined&&s.gpu_mem_total!==undefined)htm+='<div style="width:100%;text-align:center;font-size:8px;color:#556;margin-top:1px">VRAM: '+fmtSize(s.gpu_mem_used)+' / '+fmtSize(s.gpu_mem_total)+'</div>';
 if(s.disk_pct!==undefined)htm+=gauge('dsk_'+h,'DSK',parseFloat(s.disk_pct),'%');
 if(s.gpu_temp!==undefined)htm+=gauge('tmp_'+h,'TMG',s.gpu_temp,'\u00b0')+(s.gpu_temp>85?' <span class="gpu-alert">HOT</span>':'');
 if(s.cpu_temp!==undefined)htm+=gauge('cpt_'+h,'TMC',s.cpu_temp,'\u00b0');
 var hist=n.history||{};if(hist.cpu)htm+=sparkline(hist.cpu,'#0ff',100,24);
+// GPU temp/power trend sparkline (div-based)
+var gt=n.gpu_trends||{};var gtKeys=Object.keys(gt);for(var gi=0;gi<gtKeys.length;gi++){if(gtKeys[gi]===h){var trend=gt[gtKeys[gi]];if(trend&&trend.length>=2){var temps=trend.map(function(x){return x.temp});var powers=trend.map(function(x){return x.power});
+htm+='<div style="width:100%;display:flex;gap:6px;justify-content:center;margin-top:2px">'+
+'<div style="text-align:center"><div style="font-size:6px;color:#556">TEMP \u00b0</div>'+renderSparkline(temps,'#f60',28)+'</div>'+
+'<div style="text-align:center"><div style="font-size:6px;color:#556">PWR W</div>'+renderSparkline(powers,'#fa0',28)+'</div></div>';}}}
 if(s.gpu_info)htm+='<div style="width:100%;text-align:center;margin-top:2px"><span class="gpu-tag" title="'+esc(s.gpu_info)+'">'+esc(s.gpu_info.substring(0,30))+'</span></div>';
 if(s.load)htm+='<div style="width:100%;text-align:center"><span class="sys-load">LD: '+esc(s.load)+'</span></div>';
 if(s.uptime)htm+='<div style="width:100%;text-align:center"><span class="sys-up">'+esc(s.uptime)+'</span></div>';
@@ -1612,6 +1838,7 @@ htm+='</div></div>';return htm;}
 // Theme switching
 function switchTheme(t){localStorage.setItem('dltrace-theme',t);applyTheme(t)}
 function applyTheme(t){document.body.className='theme-'+t;document.querySelectorAll('.theme-btn').forEach(function(b){b.classList.toggle('active',b.dataset.theme===t)})}
+function navTo(id){document.getElementById(id).scrollIntoView({behavior:'smooth'});document.querySelectorAll('.nav-item.active').forEach(function(e){e.classList.remove('active')})}
 (function(){var t=localStorage.getItem('dltrace-theme')||'s360';applyTheme(t)})();
 // Job cards
 function fmtTime(s){if(s==null||s<0)return'--:--:--';var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=Math.floor(s%60);return (h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(ss<10?'0':'')+ss;}
@@ -1629,7 +1856,20 @@ function collectJobCards(d){var ns=d.nodes||{};var htm='';var keys=Object.keys(n
 for(var i=0;i<keys.length;i++){var h=keys[i];var n=ns[h];var jc=jobCard(n);if(jc){htm+=jc;any=true;}}
 if(!any)htm='<div class="job-empty"><div class="icon">\u{1F4AD}</div><p>\u65E0\u6D3B\u8DC3\u4EFB\u52A1</p><p style="font-size:8px;margin-top:4px">\u5199\u5165 /tmp/dltrace_jobs.json \u4EE5\u624B\u52A8\u58F0\u660E\u4EFB\u52A1</p></div>';
 _jobHtml=htm;return htm;}
-// --- end job ---
+// Docker
+function dockerCard(d){var ns=d.nodes||{};var keys=Object.keys(ns);var htm='';for(var i=0;i<keys.length;i++){var h=keys[i];var n=ns[h];var dc=n.docker||n.containers;if(!dc)continue;if(typeof dc==='object'&&!Array.isArray(dc)&&dc.containers){dc=dc.containers}if(!Array.isArray(dc)||!dc.length)continue;var fn=NODE_NAMES[h]||h.split('.')[0];var run=dc.filter(function(c){return c.state==='running'}).length;var stop=dc.length-run;var summary=(run?run+' running':'')+(run&&stop?', ':'')+(stop?stop+' stopped':'')||'n/a';
+htm+='<div class="card" style="padding:8px"><div class="card-header"><span class="card-title online"><span class="status-dot online"></span>'+esc(fn)+'</span><span style="font-size:8px;color:#448">'+summary+'</span></div><div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:3px">';
+for(var j=0;j<dc.length;j++){var c=dc[j];var ctx=c.state==='running'?'#0f0;text-shadow:0 0 4px #0f0':'#f44;text-shadow:0 0 4px #f44';var ctn=c.state==='running'?'#1a1a1a':'#080812';htm+='<div style="background:'+ctn+';border:1px solid rgba(255,255,255,0.04);border-radius:3px;padding:3px 6px;font-size:8px"><span style="color:'+ctx+'" title="'+esc(c.state)+'">\u25CF</span> '+esc(c.name||c.id||'').substring(0,25)+(c.image?' <span style="color:#445">'+esc(c.image).substring(0,20)+'</span>':'')+'</div>';}
+htm+='</div></div>';}
+return htm||'<div class="empty-state"><p style="text-align:center;color:#334;font-size:10px">No Docker data</p></div>';}
+// Disk I/O
+function diskCard(d){var ns=d.nodes||{};var keys=Object.keys(ns);var htm='';for(var i=0;i<keys.length;i++){var h=keys[i];var n=ns[h];var io=n.diskio;if(!io||!Array.isArray(io)||!io.length)continue;var fn=NODE_NAMES[h]||h.split('.')[0];var totR=0,totW=0;
+for(var k=0;k<io.length;k++){totR+=io[k].kb_read||0;totW+=io[k].kb_write||0;}
+htm+='<div class="card" style="padding:8px"><div class="card-header"><span class="card-title online"><span class="status-dot online"></span>'+esc(fn)+'</span><span style="font-size:8px;color:#448">\u2191 '+fmtKb(totR)+'  \u2193 '+fmtKb(totW)+'</span></div><table style="width:100%;margin-top:4px;border-collapse:collapse;font-size:8px"><tr style="color:#556"><td style="padding:2px 4px">Device</td><td style="padding:2px 4px;text-align:right">Read</td><td style="padding:2px 4px;text-align:right">Write</td></tr>';
+for(var k=0;k<io.length;k++){var dk=io[k];htm+='<tr><td style="padding:1px 4px;color:#aab">'+esc(dk.device||'')+'</td><td style="padding:1px 4px;text-align:right;color:#445">'+fmtKb(dk.kb_read||0)+'</td><td style="padding:1px 4px;text-align:right;color:#445">'+fmtKb(dk.kb_write||0)+'</td></tr>';}
+htm+='</table></div>';}
+return htm||'<div class="empty-state"><p style="text-align:center;color:#334;font-size:10px">No disk I/O data</p></div>';}
+// --- end docker+disk ---
 // BG particles
 (function(){var cv=document.getElementById("bg");if(!cv)return;var c=cv.getContext("2d");var pts=[];
 function rs(){cv.width=window.innerWidth;cv.height=window.innerHeight}rs();window.addEventListener("resize",rs);
@@ -1638,16 +1878,21 @@ for(var i=0;i<60;i++)pts.push({x:Math.random()*cv.width,y:Math.random()*cv.heigh
 for(var i=0;i<pts.length;i++)for(var j=i+1;j<pts.length;j++){var p=pts[i],q=pts[j],dx=p.x-q.x,dy=p.y-q.y;if(dx*dx+dy*dy<8e3){c.beginPath();c.moveTo(p.x,p.y);c.lineTo(q.x,q.y);c.stroke()}}
 for(var p of pts){p.x+=p.vx;p.y+=p.vy;if(p.x<0||p.x>cv.width)p.vx*=-1;if(p.y<0||p.y>cv.height)p.vy*=-1;c.fillStyle="#0ff";c.beginPath();c.arc(p.x,p.y,p.r,0,6.28);c.fill()}requestAnimationFrame(d)})();})();
 var NODE_NAMES={{NODE_NAMES_JSON}}
-function render(d){var ns=d.nodes||{};var keys=Object.keys(ns);
-var sys='';for(var i=0;i<keys.length;i++)sys+=sysCard(keys[i],ns[keys[i]]);$('sys-grid').innerHTML=sys;
+function render(d){var ns=d.nodes||{};var keys=Object.keys(ns);var gt=d.gpu_trends||{};
+var sys='';for(var i=0;i<keys.length;i++){var gtKey=gt[keys[i]];var nn=ns[keys[i]];if(gtKey){nn.gpu_trends={};nn.gpu_trends[keys[i]]=gtKey;}sys+=sysCard(keys[i],nn);}$('sys-grid').innerHTML=sys;
 $('net-section').innerHTML=netCard(d);
 var dl='';for(var i=0;i<keys.length;i++)dl+=dlCard(keys[i],ns[keys[i]]);$('dl-grid').innerHTML=dl;
 var jb=collectJobCards(d);$('job-grid').innerHTML=jb;
+var dc=dockerCard(d);$('docker-grid').innerHTML=dc;
+var dk=diskCard(d);$('diskio-grid').innerHTML=dk;
 var total=0;for(var k in ns)total+=ns[k].tracked_total||0;
 var sb=document.querySelector('.topbar > span:last-child');if(sb)sb.innerHTML='<span class="status-dot online"></span> '+keys.length+' nodes \u00B7 '+total+' files  <span style="margin-left:8px;color:#224">5s \u00B7 auto</span>';
 var mr=document.querySelector('meta[http-equiv="refresh"]');if(mr)mr.parentNode.removeChild(mr);}
+function switchTheme(t){var b=document.body;b.classList.remove('theme-s360','theme-netdata');b.classList.add('theme-'+t);document.querySelectorAll('.stheme-btn').forEach(function(e){e.classList.toggle('active',e.dataset.theme===t)});localStorage.setItem('dltrace-theme',t);}
+(function(){var t=localStorage.getItem('dltrace-theme');if(t)switchTheme(t);})();
 try{render({{DATA}});}catch(e){}
 (function poll(){setTimeout(function(){fetch('/api/v1/metrics').then(function(r){return r.json()}).then(function(d){render(d);poll();}).catch(function(){setTimeout(poll,POLL);});},POLL);})();
+setInterval(function(){var on=document.querySelectorAll('.status-dot.online').length;var tot=document.querySelectorAll('.sys-card').length||on;document.title=(on===tot?'\uD83D\uDFE2':'\uD83D\uDD34')+on+'/'+tot+' | K38';},3000);
 </script></body></html>"""
 
 
