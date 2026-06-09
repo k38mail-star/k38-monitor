@@ -1508,7 +1508,8 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                 try:
                     import urllib.request
                     r = urllib.request.urlopen(url, timeout=8)
-                    return name, json.loads(r.read().decode())
+                    data = json.loads(r.read().decode())
+                    return name, data
                 except Exception:
                     return name, {}
             with ThreadPoolExecutor(max_workers=4) as pool:
