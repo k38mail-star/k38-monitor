@@ -106,7 +106,7 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 # 配置常量
 # ════════════════════════════════════════════
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 # ── 文件路径 ──
 PROGRESS_FILE  = "/tmp/dltrace.json"
