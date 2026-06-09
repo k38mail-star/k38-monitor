@@ -1499,8 +1499,8 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                 hardcoded={
                     "三万八":    "http://192.168.3.29:8899/api/v1/metrics",
                     "小四":      "http://192.168.3.46:8899/api/v1/metrics",
-                    "大傻":      "http://192.168.3.55:8890/api/v1/metrics",
-                    "二傻":      "http://192.168.3.45:8890/api/v1/metrics",
+                    "大傻":      "http://192.168.3.55:8899/api/v1/metrics",
+                    "二傻":      "http://192.168.3.45:8899/api/v1/metrics",
                 }
             )
             # 并行HTTP拉取(兼容旧数据格式)
