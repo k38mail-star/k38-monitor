@@ -19,14 +19,14 @@ import glob
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from typing import Any
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
@@ -68,16 +68,45 @@ sys.dont_write_bytecode = True
 
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
-    """多线程HTTP服务器"""
+    """多线程HTTP服务器，带线程上限防止自引用死锁"""
     allow_reuse_address = True
     daemon_threads = True
+    _max_workers = 32
+    _worker_count = 0
+    _worker_lock = threading.Lock()
+
+    def process_request(self, request, client_address):
+        """带线程上限: 超过上限时静默丢弃连接"""
+        with self._worker_lock:
+            if self._worker_count >= self._max_workers:
+                try:
+                    request.close()
+                except OSError:
+                    pass
+                return
+            self._worker_count += 1
+        t = threading.Thread(target=self._process_request_thread_wrapper,
+                             args=(request, client_address))
+        t.daemon = True
+        t.start()
+
+    def _process_request_thread_wrapper(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+            self.shutdown_request(request)
+        except Exception:
+            self.handle_error(request, client_address)
+            self.shutdown_request(request)
+        finally:
+            with self._worker_lock:
+                self._worker_count -= 1
 
 
 # ════════════════════════════════════════════
 # 配置常量
 # ════════════════════════════════════════════
 
-__version__ = "0.3.0"
+__version__ = "0.3.2"
 
 # ── 文件路径 ──
 PROGRESS_FILE  = "/tmp/dltrace.json"
@@ -98,7 +127,7 @@ MAX_PROCESSES     = 10
 HISTORY_LEN       = 60
 HISTORY_SAVE_SEC  = 300   # 历史文件最长保留5分钟
 LOG_MAX_SIZE      = 1_000_000
-GPU_TREND  = {}          # GPU趋势缓存, keyed by node_key
+GPU_TREND: dict[str, deque] = {}  # GPU趋势缓存, keyed by node_key
 MAX_TREND  = 12          # GPU趋势最大样本数
 
 # ── 速度窗口 ──
@@ -190,7 +219,7 @@ class FileTracker:
         self.path = path
         self.name = os.path.basename(path)
         self.prev_size = 0
-        self.first_size = None
+        self.first_size: int | None = None
         self.first_seen = time.time()
         self.last_growth = time.time()
         self.growth_count = 0
@@ -293,8 +322,8 @@ class DownloadTracker:
     """在目标机上运行的追踪器, 监控文件变化"""
 
     _ping_cycle = 0
-    _ping_cache = {}
-    _proc_cache = []
+    _ping_cache: dict = {}
+    _proc_cache: list = []
     _proc_cycle = PROC_INTERVAL  # 首次立即扫描
 
     def __init__(self, watch_dirs=None,
@@ -304,7 +333,7 @@ class DownloadTracker:
         self.progress_file = progress_file
         self.poll_interval = poll_interval
         self.trackers: dict[str, FileTracker] = {}
-        self._history = {"cpu": deque(maxlen=HISTORY_LEN), "mem": deque(maxlen=HISTORY_LEN),
+        self._history: dict[str, deque] = {"cpu": deque(maxlen=HISTORY_LEN), "mem": deque(maxlen=HISTORY_LEN),
                          "gpu": deque(maxlen=HISTORY_LEN), "gpu_temp": deque(maxlen=HISTORY_LEN),
                          "cpu_temp": deque(maxlen=HISTORY_LEN), "load": deque(maxlen=HISTORY_LEN)}
         self._history_lock = threading.Lock()  # 线程安全
@@ -397,15 +426,15 @@ class DownloadTracker:
                         continue
                     for tag, pat in DL_TOOL_PATTERNS.items():
                         if re.search(pat, cmd):
-                            info: dict = {
+                            cinfo: dict = {
                                 "pid": int(entry),
                                 "tag": tag,
                                 "cmd": cmd[:120],
                             }
                             url_m = re.search(r"(https?://[^\s\"'<>]+)", cmd)
                             if url_m:
-                                info["url"] = url_m.group(1).rstrip("'").rstrip('"')[:120]
-                            procs.append(info)
+                                cinfo["url"] = url_m.group(1).rstrip("'").rstrip('"')[:120]
+                            procs.append(cinfo)
                             break
             else:
                 # macOS fallback: 使用 ps 命令
@@ -422,15 +451,15 @@ class DownloadTracker:
                     pid_str, cmd = parts
                     for tag, pat in DL_TOOL_PATTERNS.items():
                         if re.search(pat, cmd):
-                            info: dict = {
+                            cinfo: dict = {  # type: ignore[no-redef]
                                 "pid": int(pid_str),
                                 "tag": tag,
                                 "cmd": cmd[:120],
                             }
                             url_m = re.search(r"(https?://[^\s\"'<>]+)", cmd)
                             if url_m:
-                                info["url"] = url_m.group(1).rstrip("'").rstrip('"')[:120]
-                            procs.append(info)
+                                cinfo["url"] = url_m.group(1).rstrip("'").rstrip('"')[:120]
+                            procs.append(cinfo)
                             break
         except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError, PermissionError):
             pass
@@ -440,7 +469,7 @@ class DownloadTracker:
 
     def _collect_network(self) -> dict:
         """采集200G直连 + Thunderbolt链接"""
-        net = {"link200": {}, "tb": []}
+        net: dict = {"link200": {}, "tb": []}
         hostname = os.uname().nodename
 
         if "spark" in hostname:
@@ -467,16 +496,16 @@ class DownloadTracker:
                 pass
 
             peer = peer or ("192.168.100.102" if "9051" in hostname else "192.168.100.101")
-            nodes_nm = f"spark-9051 ↔ spark-9797"
+            nodes_nm = "spark-9051 ↔ spark-9797"
             net["link200"]["link200_nodes"] = nodes_nm
 
             try:
-                out = subprocess.run(
+                out = subprocess.run(  # type: ignore[assignment]
                     ["ping", "-c", "1", "-W", "1", peer],
                     capture_output=True, text=True, timeout=2
                 )
-                if out.returncode == 0:
-                    m = re.search(r"time=(\d+\.?\d*)\s*ms", out.stdout)
+                if out.returncode == 0:  # type: ignore[attr-defined]
+                    m = re.search(r"time=(\d+\.?\d*)\s*ms", out.stdout)  # type: ignore[attr-defined]
                     lat = float(m.group(1)) if m else 0.15
                     net["link200"]["up"] = True
                     net["link200"]["latency"] = lat
@@ -534,12 +563,12 @@ class DownloadTracker:
                 if isinstance(raw, list):
                     for j in raw:
                         jtype = j.get("type", "content")
-                        st = j.get("status", "running")
+                        # st = j.get("status", "running")
                         # 计算已耗时
                         elapsed = now - j.get("started_ts", now)
                         j["elapsed_s"] = round(elapsed)
                         # 计算剩余
-                        est = j.get("estimated_sec", 0)
+                        est = (j.get("estimated_sec") or 0)
                         if est > 0:
                             j["remaining_s"] = round(max(0, est - elapsed))
                             j["pct"] = min(100, round(elapsed / est * 100, 1))
@@ -624,7 +653,7 @@ class DownloadTracker:
                                capture_output=True, text=True, timeout=5)
             if r.returncode != 0:
                 return out
-            containers = []
+            containers: list[dict] = []
             for line in r.stdout.strip().split("\n"):
                 if not line.strip():
                     continue
@@ -637,7 +666,7 @@ class DownloadTracker:
                     "id": cid, "image": image[:40], "name": name,
                     "status": status[:60], "state": "running" if running else "stopped"
                 })
-            out["containers"] = containers
+            out["containers"] = containers  # type: ignore[assignment]
             run_c = sum(1 for c in containers if c["state"] == "running")
             stop_c = len(containers) - run_c
             out["summary"] = (f"{run_c} running" if run_c else "") + \
@@ -684,7 +713,7 @@ class DownloadTracker:
 
     def _collect_system_info(self) -> dict:
         """收集系统信息: CPU/内存/磁盘/GPU(跨平台Mac+Linux)"""
-        info: dict = {}
+        info: dict[str, Any] = {}
 
         # Mac系统
         if sys.platform == "darwin":
@@ -711,17 +740,17 @@ class DownloadTracker:
                 free = active = wired = 0
                 for line in out.split("\n"):
                     if "page size" in line:
-                        m = re.search(r'(\d+)', line)
-                        if m: pagesize = int(m.group(1))
+                        _m = re.search(r'(\d+)', line)
+                        if _m: pagesize = int(_m.group(1))
                     elif "Pages free" in line:
-                        m = re.search(r'(\d+)', line)
-                        if m: free = int(m.group(1))
+                        _m = re.search(r'(\d+)', line)
+                        if _m: free = int(_m.group(1))
                     elif "Pages active" in line:
-                        m = re.search(r'(\d+)', line)
-                        if m: active = int(m.group(1))
+                        _m = re.search(r'(\d+)', line)
+                        if _m: active = int(_m.group(1))
                     elif "Pages wired" in line:
-                        m = re.search(r'(\d+)', line)
-                        if m: wired = int(m.group(1))
+                        _m = re.search(r'(\d+)', line)
+                        if _m: wired = int(_m.group(1))
                 mem_used = (active + wired) * pagesize / 1e9
                 mem_total = (free + active + wired) * pagesize / 1e9
                 if mem_total > 0:
@@ -847,7 +876,7 @@ class DownloadTracker:
 
     def _collect_ping(self) -> dict:
         """采集网络延迟(Ping) + 出口IP"""
-        result = {}
+        result: dict[str, Any] = {}
         targets = [("baidu_ms", "baidu.com"), ("ytb_ms", "www.youtube.com")]
         # macOS -W is timeout in seconds (same as Linux), -t is TTL
         to = "-W"
@@ -1148,23 +1177,23 @@ def cmd_watch(args: argparse.Namespace):
         lines.append(f"dltrace v{data.get('version', '?')}  -  {data.get('hostname', '?')}  -  {data.get('ts_str', '??')}")
         lines.append("─" * 60)
 
-        files = data.get("active_files", [])
+        files = data.get("active_files") or []
         if files:
             for f in files:
-                pct = f.get("pct", 0)
+                pct = (f.get("pct") or 0)
                 bar = format_bar(pct)
                 name = f.get("name", "?")
-                size = f.get("size_mb", 0)
-                speed = f.get("speed_mb", 0)
+                size = (f.get("size_mb") or 0)
+                speed = (f.get("speed_mb") or 0)
                 status = f.get("status", "?")
                 tag = f.get("tag", "?")
                 lines.append(f"  {bar} {pct:3d}%  {size:>7.1f}MB  {speed:>5.2f}MB/s  [{tag}] {name}")
                 if status in ("done", "stale"):
-                    lines.append(f"         ✅ 下载完成")
+                    lines.append("         ✅ 下载完成")
         else:
             lines.append("  (没有活跃的下载活动)")
 
-        procs = data.get("active_procs", [])
+        procs = data.get("active_procs") or []
         if procs:
             lines.append("")
             lines.append(f"  进程: {' '.join(p['tag'] for p in procs)}")
@@ -1235,6 +1264,15 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
             """读取所有监控节点的数据(并行SSH, 单节点超时不阻塞)"""
             nodes = {}
 
+            # 惰性初始化自身URL(用于跳过自引用HTTP拉取)
+            if not hasattr(self, "_self_url"):
+                try:
+                    sockname = self.request.getsockname()[:2]  # (ip, port)
+                    url = f"http://{sockname[0]}:{sockname[1]}/api/v1/metrics"
+                    self._self_url = url
+                except Exception:
+                    self._self_url = None
+
             # 本地节点: 总是包含
             try:
                 if os.path.exists(self._progress_file):
@@ -1247,26 +1285,46 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                                         "files_count": 0, "procs_count": 0}
 
             # 已知所有节点的HTTP API（支持动态配置）
+            # 自动排除自身节点的HTTP拉取, 防止循环死锁
+            _self_url = getattr(self, "_self_url", None)
             KNOWN_NODES = _load_node_config(
                 hardcoded={
                     "三万八":    "http://192.168.3.29:8899/api/v1/metrics",
                     "小四":      "http://192.168.3.46:8899/api/v1/metrics",
-                    "大傻":      "http://192.168.3.55:8899/api/v1/metrics",
-                    "二傻":      "http://192.168.3.45:8899/api/v1/metrics",
+                    "大傻":      "http://192.168.3.55:8890/api/v1/metrics",
+                    "二傻":      "http://192.168.3.45:8890/api/v1/metrics",
                 }
             )
             # 并行HTTP拉取(兼容旧数据格式)
             def _pull_node(name, url):
                 try:
                     import urllib.request
-                    r = urllib.request.urlopen(url, timeout=3)
+                    r = urllib.request.urlopen(url, timeout=8)
                     return name, json.loads(r.read().decode())
                 except Exception:
                     return name, {}
             with ThreadPoolExecutor(max_workers=4) as pool:
-                for name, nd in pool.map(lambda kv: _pull_node(*kv), KNOWN_NODES.items()):
-                    if nd and name not in nodes:
-                        nodes[name] = nd
+                import concurrent.futures
+                futs = {}
+                for n, u in KNOWN_NODES.items():
+                    if _self_url and u == _self_url:
+                        continue
+                    futs[pool.submit(_pull_node, n, u)] = n
+                try:
+                    for future in concurrent.futures.as_completed(futs, timeout=12):
+                        name = futs[future]
+                        try:
+                            result = future.result()  # (name, data_dict)
+                            if isinstance(result, tuple) and len(result) == 2:
+                                nd_data = result[1]
+                            else:
+                                nd_data = result
+                            if nd_data and name not in nodes:
+                                nodes[name] = nd_data
+                        except Exception:
+                            pass
+                except concurrent.futures.TimeoutError:
+                    pass  # 总体超时不阻塞
 
             if not nodes:
                 nodes["localhost"] = {"hostname": "localhost", "ts_str": "--:--:--",
@@ -1305,10 +1363,10 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                 data["nodes"] = nodes_clean  # 用无循环引用的副本
                 data["nodes_count"] = len(nodes)
                 # 优先使用DGX节点的network数据(有200G链接信息)
-                top_nw = data.get("network", {})
+                top_nw = data.get("network") or {}
                 if not top_nw.get("link200") or not top_nw.get("link200", {}).get("up"):
                     for h, nd in nodes_clean.items():
-                        nw = nd.get("network", {})
+                        nw = nd.get("network") or {}
                         if nw.get("link200") and nw["link200"].get("up"):
                             data["network"] = nw
                             break
@@ -1321,19 +1379,21 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
             pass  # 静默
 
         def do_GET(self):
-            data = self._read_data()
             path = self.path.split("?")[0].split("#")[0]
+            # 健康检查: 不触发聚合查询, 防止递归死锁
+            if path == "/health":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"OK")
+                return
+            data = self._read_data()
             if path == "/api/v1/metrics":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(json.dumps(data).encode())
-            elif path == "/health":
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(b"OK")
             elif path == "/api/v1/json":
                 # 原始JSON
                 self.send_response(200)
@@ -1360,7 +1420,7 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
 
                 def esc(s): return hlib.escape(str(s)) if s is not None else ""
                 def bar_cls(s): return "dl-done" if s in ("done","stale") else ("dl-finish" if s=="finishing" else "dl-down")
-                NODE_NAMES = {"localhost": "十六万", "10.0.0.146": "大傻 spark-9051", "192.168.3.45": "二傻 spark-9797", "169.254.54.212": "小四", "192.168.3.29": "三万八"}
+                NODE_NAMES = {"localhost": "十六万", "192.168.3.55": "大傻 spark-9051", "192.168.3.46": "小四", "192.168.3.45": "二傻 spark-9797", "192.168.3.29": "三万八", "大傻": "大傻 spark-9051", "二傻": "二傻 spark-9797", "小四": "小四", "三万八": "三万八"}
                 def tag_icon(t):
                     tl=(t or "").lower()
                     if tl.find("model")>=0 or tl.find("qwen")>=0 or tl.find("llm")>=0 or tl.find("safetensors")>=0: return "🧠"
@@ -1416,7 +1476,7 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                 for h, n in ns.items():
                     friendly = NODE_NAMES.get(h, h.split(".")[0] if "." in h else h)
                     s = n.get("system", {})
-                    dots = n.get("tracked_total", 0) > 0 or n.get("ts", 0) > 1700000000
+                    dots = (n.get("tracked_total") or 0) > 0 or (n.get("ts") or 0) > 1700000000
                     dc = "online" if dots else "offline"; tc = "#0ff" if dots else "#222"
                     card = f'<div class="card sys-card" style="border-top:2px solid {tc}"><div class="card-header"><span class="card-title {dc}"><span class="status-dot {dc}"></span>{esc(friendly)}</span><span class="card-ts">{n.get("ts_str","--:--:--")}</span></div><div style="display:flex;flex-wrap:wrap;justify-content:center;gap:2px">'
                     if s.get("cpu_pct") is not None: card += _sys_gauge("CPU", s["cpu_pct"], "%")
@@ -1427,9 +1487,9 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                     if s.get("gpu_temp") is not None: card += _sys_gauge("TMG", s["gpu_temp"], "\u00b0")
                     if s.get("cpu_temp") is not None: card += _sys_gauge("TMC", s["cpu_temp"], "\u00b0")
                     # 趋势sparkline
-                    hist = n.get("history", {})
+                    hist = n.get("history") or {}
                     if hist.get("cpu"): card += _sparkline(hist["cpu"], "#0ff", 100, 24)
-                    gpu_info = s.get("gpu_info", "")
+                    gpu_info = (s.get("gpu_info") or "")
                     if gpu_info: card += f'<div style="width:100%;text-align:center;margin-top:2px"><span class="gpu-tag" title="{esc(gpu_info)}">{esc(gpu_info[:30])}</span></div>'
                     if s.get("load"): card += f'<div style="width:100%;text-align:center"><span class="sys-load">LD: {esc(s["load"])}</span></div>'
                     if s.get("uptime"): card += f'<div style="width:100%;text-align:center"><span class="sys-up">{esc(s["uptime"])}</span></div>'
@@ -1437,17 +1497,16 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
 
                 # Network section
                 net_html = '<div class="card net-card"><div class="net-top">'
-                l200 = data.get("network", {}).get("link200", {})
+                l200 = (data.get("network") or {}).get("link200", {})
                 lkc = "#0f0" if l200.get("up") else "#f44"
-                lkt = f"{l200['latency']:.2f}ms" if l200.get("latency") else ("DOWN" if l200.get("up")==False else "...")
+                lkt = f"{l200['latency']:.2f}ms" if l200.get("latency") else ("DOWN" if not l200.get("up") else "...")
                 nodes_200g = l200.get("link200_nodes", "spark-9051 ↔ spark-9797")
                 net_html += f'<div class="net-200g"><span class="net-200g-icon">⚡</span><span class="net-200g-label">200G</span><span class="net-200g-nodes">{nodes_200g}</span><span class="net-200g-lat" style="color:{lkc}">{lkt}</span></div>'
-                tbs = data.get("network", {}).get("tb", [])
+                tbs = (data.get("network") or {}).get("tb", [])
                 for tb in tbs: net_html += f'<div class="net-tb-link">🗡 {esc(tb.get("from",""))} ↔ {esc(tb.get("to",""))} <span class="net-tb-speed">{esc(tb.get("speed",""))}</span></div>'
                 net_html += '</div><div class="net-ping-grid">'
-                NET_ICONS = {"localhost":"💻","192.168.3.55":"🖥","192.168.3.45":"🖥","169.254.54.212":"📱","169.254.196.171":"📱"}
                 for h, n in ns.items():
-                    p = n.get("ping", {})
+                    p = n.get("ping") or {}
                     b = p.get("baidu_ms", "-")
                     g = p.get("ytb_ms", "-")
                     fn = NODE_NAMES.get(h, h)
@@ -1457,7 +1516,7 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                     gv = f'{g:.0f}' if isinstance(g, (int,float)) else '?'
                     bc = "c-green" if isinstance(b,(int,float)) and b < 50 else ("c-yellow" if isinstance(b,(int,float)) and b < 100 else "c-red") if isinstance(b,(int,float)) else "c-gray"
                     gc = "c-green" if isinstance(g,(int,float)) and g < 100 else ("c-yellow" if isinstance(g,(int,float)) and g < 200 else "c-red") if isinstance(g,(int,float)) else "c-gray"
-                    icon = NET_ICONS.get(h, "💻")
+                    # icon = NET_ICONS.get(h, "💻")
                     loctxt = loc[:30] if loc else ""
                     net_html += (f'<div class="np-card"><div class="np-head"><span class="np-dot {dot}"></span><span class="np-name">{esc(fn)}</span></div>'
                                 f'<div class="np-pings"><span class="np-ping"><span class="np-label">百度</span><span class="np-val {bc}">{bv}</span></span>'
@@ -1467,11 +1526,11 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                 dl_html = ""
                 total_files = 0
                 for h, n in ns.items():
-                    f = n.get("active_files", [])
-                    dots = n.get("tracked_total", 0) > 0 or n.get("ts", 0) > 1700000000
+                    f = n.get("active_files") or []
+                    dots = (n.get("tracked_total") or 0) > 0 or (n.get("ts") or 0) > 1700000000
                     title_cls = "online" if dots else "offline"
-                    dot_cls = "online" if dots else ("done" if n.get("files_count", 0) else "offline")
-                    total_files += n.get("tracked_total", 0)
+                    dot_cls = "online" if dots else ("done" if (n.get("files_count") or 0) else "offline")
+                    total_files += (n.get("tracked_total") or 0)
 
                     friendly = NODE_NAMES.get(h, h.split(".")[0] if "." in h else h)
                     card = f'<div class="card"><div class="card-header"><span class="card-title {title_cls}"><span class="status-dot {dot_cls}"></span>{esc(friendly)}</span><span class="card-ts">{n.get("ts_str","--:--:--")}</span></div>'
@@ -1482,11 +1541,11 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                     if f:
                         card += '<ul class="dl-list">'
                         for ff in f:
-                            pct = ff.get("pct", 0)
-                            sz = ff.get("size_mb", 0)
-                            sp = ff.get("speed_mb", 0)
-                            nm = ff.get("name", "")
-                            st = ff.get("status", "")
+                            pct = f(f.get("pct") or 0)
+                            sz = f(f.get("size_mb") or 0)
+                            sp = f(f.get("speed_mb") or 0)
+                            nm = (ff.get("name") or "")
+                            st = (ff.get("status") or "")
                             ic = tag_icon(ff.get("tag",""))
                             bc = bar_cls(st)
                             pct_cls = "pct-ok" if pct>=100 else ("pct-mid" if pct>50 else "pct-low")
@@ -1725,13 +1784,13 @@ body.theme-netdata .sidebar-nav .nav-item{margin:1px 4px}
 <div class="sidebar">
 <div class="sidebar-title">▣ K38</div>
 <div class="sidebar-nav">
-<div class="nav-item" onclick="navTo('sys-grid');this.classList.add('active')">MONITOR</div>
-<div class="nav-item" onclick="navTo('job-grid');this.classList.add('active')">JOBS</div>
-<div class="nav-item" onclick="navTo('net-section');this.classList.add('active')">NET</div>
-<div class="nav-item" onclick="navTo('dl-grid');this.classList.add('active')">DL</div>
-<div class="nav-item" onclick="navTo('svc-grid');this.classList.add('active')">SVC</div>
-<div class="nav-item" onclick="navTo('docker-grid');this.classList.add('active')">DOCK</div>
-<div class="nav-item" onclick="navTo('diskio-grid');this.classList.add('active')">DISK</div>
+<div class="nav-item" onclick="navTo(this,'sys-grid')">MONITOR</div>
+<div class="nav-item" onclick="navTo(this,'job-grid')">JOBS</div>
+<div class="nav-item" onclick="navTo(this,'net-section')">NET</div>
+<div class="nav-item" onclick="navTo(this,'dl-grid')">DL</div>
+<div class="nav-item" onclick="navTo(this,'svc-grid')">SVC</div>
+<div class="nav-item" onclick="navTo(this,'docker-grid')">DOCK</div>
+<div class="nav-item" onclick="navTo(this,'diskio-grid')">DISK</div>
 </div>
 <div class="sidebar-bottom">
 <div class="topo-map">
@@ -1753,7 +1812,7 @@ body.theme-netdata .sidebar-nav .nav-item{margin:1px 4px}
 </div>
 </div>
 </div>
-<div class="header"><h1>▣ K38 MONITOR</h1><div class="sub">CLUSTER DASHBOARD · v0.3.0</div></div>
+<div class="header"><h1>▣ K38 MONITOR</h1><div class="sub">CLUSTER DASHBOARD · v0.3.2</div></div>
 <div class="topbar">
 <div class="theme-switch">
 <span class="theme-btn active" data-theme="s360" onclick="switchTheme('s360')">SERVER360</span>
@@ -1836,9 +1895,9 @@ var gc=typeof g==='number'?(g<100?'c-green':g<200?'c-yellow':'c-red'):'c-gray';
 htm+='<div class="np-card"><div class="np-head"><span class="np-dot '+dot+'"></span><span class="np-name">'+esc(fn)+'</span></div><div class="np-pings"><span class="np-ping"><span class="np-label">\u767e\u5ea6</span><span class="np-val '+bc+'">'+bv+'</span></span><span class="np-ping"><span class="np-label">YTB</span><span class="np-val '+gc+'">'+gv+'</span></span></div><div class="np-loc">'+esc(loc.slice(0,30))+'</div></div>';}
 htm+='</div></div>';return htm;}
 // Theme switching
-function switchTheme(t){localStorage.setItem('dltrace-theme',t);applyTheme(t)}
-function applyTheme(t){document.body.className='theme-'+t;document.querySelectorAll('.theme-btn').forEach(function(b){b.classList.toggle('active',b.dataset.theme===t)})}
-function navTo(id){document.getElementById(id).scrollIntoView({behavior:'smooth'});document.querySelectorAll('.nav-item.active').forEach(function(e){e.classList.remove('active')})}
+function switchTheme(t){localStorage.setItem('dltrace-theme',t);document.body.className='theme-'+t;document.querySelectorAll('.theme-btn,.stheme-btn').forEach(function(b){b.classList.toggle('active',b.dataset.theme===t)})}
+function applyTheme(t){switchTheme(t)}
+function navTo(el,id){document.getElementById(id).scrollIntoView({behavior:'smooth'});document.querySelectorAll('.nav-item.active').forEach(function(e){e.classList.remove('active')});el.classList.add('active')}
 (function(){var t=localStorage.getItem('dltrace-theme')||'s360';applyTheme(t)})();
 // Job cards
 function fmtTime(s){if(s==null||s<0)return'--:--:--';var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=Math.floor(s%60);return (h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(ss<10?'0':'')+ss;}
@@ -1894,7 +1953,7 @@ var dk=diskCard(d);$('diskio-grid').innerHTML=dk;
 var total=0;for(var k in ns)total+=ns[k].tracked_total||0;
 var sb=document.querySelector('.topbar > span:last-child');if(sb)sb.innerHTML='<span class="status-dot online"></span> '+keys.length+' nodes \u00B7 '+total+' files  <span style="margin-left:8px;color:#224">5s \u00B7 auto</span>';
 var mr=document.querySelector('meta[http-equiv="refresh"]');if(mr)mr.parentNode.removeChild(mr);}
-function switchTheme(t){var b=document.body;b.classList.remove('theme-s360','theme-netdata');b.classList.add('theme-'+t);document.querySelectorAll('.stheme-btn').forEach(function(e){e.classList.toggle('active',e.dataset.theme===t)});localStorage.setItem('dltrace-theme',t);}
+
 (function(){var t=localStorage.getItem('dltrace-theme');if(t)switchTheme(t);})();
 try{render({{DATA}});}catch(e){}
 (function poll(){setTimeout(function(){fetch('/api/v1/metrics').then(function(r){return r.json()}).then(function(d){render(d);poll();}).catch(function(){setTimeout(poll,POLL);});},POLL);})();
@@ -1946,9 +2005,9 @@ def cmd_deploy(args: argparse.Namespace):
         capture_output=True, text=True, timeout=5
     )
     if result.stdout and '"ts"' in result.stdout:
-        print(f"[dltrace]   ✅ Daemon running, data available")
+        print("[dltrace]   ✅ Daemon running, data available")
     else:
-        print(f"[dltrace]   ⚠️  Daemon may not be producing data yet")
+        print("[dltrace]   ⚠️  Daemon may not be producing data yet")
         print(f"[dltrace]   Run: ssh {target} tail -20 ~/dltrace.log")
 
 
@@ -2027,7 +2086,7 @@ def _ssh_watch(args: argparse.Namespace):
 
     print(f"[dltrace] Remote watch via {target}")
     print(f"[dltrace] Reading {target}:{progress_file}")
-    print(f"[dltrace] Press Ctrl+C to quit\n")
+    print("[dltrace] Press Ctrl+C to quit\n")
 
     last_render = ""
     while True:
@@ -2043,19 +2102,19 @@ def _ssh_watch(args: argparse.Namespace):
         except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
             data = {}
 
-        files = data.get("active_files", [])
+        files = data.get("active_files") or []
         ts = data.get("ts_str", "--:--:--")
         host = data.get("hostname", target)
 
         lines = [f"dltrace - {host} - {ts}", "─" * 60]
         if files:
             for f in files:
-                pct = f.get("pct", 0)
+                pct = (f.get("pct") or 0)
                 bar_len = max(0, pct // 5)
                 bar = "█" * bar_len + "░" * (20 - bar_len)
                 name = f.get("name", "?")
-                size = f.get("size_mb", 0)
-                speed = f.get("speed_mb", 0)
+                size = (f.get("size_mb") or 0)
+                speed = (f.get("speed_mb") or 0)
                 tag = f.get("tag", "?")
                 status = f.get("status", "?")
                 size_str = f"{size:.1f}M" if size else "?M"
