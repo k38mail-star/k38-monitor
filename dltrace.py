@@ -1865,8 +1865,14 @@ return htm||'<div class="empty-state"><p style="text-align:center;color:#334;fon
 // Disk I/O
 function diskCard(d){var ns=d.nodes||{};var keys=Object.keys(ns);var htm='';for(var i=0;i<keys.length;i++){var h=keys[i];var n=ns[h];var io=n.diskio;if(!io||!Array.isArray(io)||!io.length)continue;var fn=NODE_NAMES[h]||h.split('.')[0];var totR=0,totW=0;
 for(var k=0;k<io.length;k++){totR+=io[k].kb_read||0;totW+=io[k].kb_write||0;}
-htm+='<div class="card" style="padding:8px"><div class="card-header"><span class="card-title online"><span class="status-dot online"></span>'+esc(fn)+'</span><span style="font-size:8px;color:#448">\u2191 '+fmtKb(totR)+'  \u2193 '+fmtKb(totW)+'</span></div><table style="width:100%;margin-top:4px;border-collapse:collapse;font-size:8px"><tr style="color:#556"><td style="padding:2px 4px">Device</td><td style="padding:2px 4px;text-align:right">Read</td><td style="padding:2px 4px;text-align:right">Write</td></tr>';
-for(var k=0;k<io.length;k++){var dk=io[k];htm+='<tr><td style="padding:1px 4px;color:#aab">'+esc(dk.device||'')+'</td><td style="padding:1px 4px;text-align:right;color:#445">'+fmtKb(dk.kb_read||0)+'</td><td style="padding:1px 4px;text-align:right;color:#445">'+fmtKb(dk.kb_write||0)+'</td></tr>';}
+htm+='<div class="card" style="padding:8px"><div class="card-header"><span class="card-title online"><span class="status-dot online"></span>'+esc(fn)+'</span><span style="font-size:8px;color:#448">\u2191 '+fmtKb(totR)+'  \u2193 '+fmtKb(totW)+'</span></div><table style="width:100%;margin-top:4px;border-collapse:collapse;font-size:8px"><tr style="color:#556"><td style="padding:2px 4px">Device</td><td style="padding:2px 4px">Activity</td><td style="padding:2px 4px;text-align:right">R/W</td></tr>';
+for(var k=0;k<io.length;k++){var dk=io[k];var r=dk.kb_read||0;var w=dk.kb_write||0;var mx=Math.max(1,totR,totW);var rp=r/mx*100;var wp=w/mx*100;
+htm+='<tr><td style="padding:1px 4px;color:#aab;white-space:nowrap">'+esc(dk.device||'')+'</td>'
++'<td style="padding:1px 4px"><div style="display:flex;height:8px;border-radius:4px;overflow:hidden;width:50px;background:#1a1e2e">'
++'<div style="width:'+rp+'%;background:#2e6;min-width:1px"></div>'
++'<div style="width:'+wp+'%;background:#48f;min-width:1px"></div>'
++'</div></td>'
++'<td style="padding:1px 4px;text-align:right;white-space:nowrap;color:#889">R'+fmtKb(r)+'&nbsp;W'+fmtKb(w)+'</td></tr>';}
 htm+='</table></div>';}
 return htm||'<div class="empty-state"><p style="text-align:center;color:#334;font-size:10px">No disk I/O data</p></div>';}
 // --- end docker+disk ---
