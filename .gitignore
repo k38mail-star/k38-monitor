@@ -6,3 +6,5 @@ dist/
 *.pid
 /tmp/dltrace.json
 .DS_Store
+*.bak
+*.pre_*
