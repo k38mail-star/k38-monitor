@@ -106,7 +106,7 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 # 配置常量
 # ════════════════════════════════════════════
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 # ── 文件路径 ──
 PROGRESS_FILE  = "/tmp/dltrace.json"
@@ -162,7 +162,7 @@ NODE_FIELDS = ["hostname", "ts_str", "active_files", "active_procs",
 DL_TOOL_PATTERNS = {
     "wget":  r"wget\s",
     "curl":  r"curl\s+-[a-zA-Z]*[Oo]\s",
-    "dd":    r"dd\s+if=",
+    # "dd":    r"dd\s+if=",
     "pip":   r"pip\s+(install|download)\s",
     "pip3":  r"pip3\s+(install|download)\s",
     "git":   r"git\s+clone\s",
@@ -247,7 +247,7 @@ class FileTracker:
 
         self.history.append((now, size))
         # 裁剪历史
-        while len(self.history) > 2 and self.history[0][0] < now - SPEED_WINDOW_SEC:
+        while (len(self.history) > 2 and self.history[0][0] < now - SPEED_WINDOW_SEC) or len(self.history) > 120:
             self.history.pop(0)
 
         # 速度(最近10秒内插值)
@@ -486,7 +486,7 @@ class DownloadTracker:
                     if m:
                         local_ib = m.group(2).split("/")[0]
                         # Peer: same /24 subnet, different last octet
-                        parts = local_ib.rsplit(".", 1)
+                        parts = (local_ib or "").rsplit(".", 1)
                         if len(parts) == 2:
                             last = int(parts[1])
                             peer_last = 102 if last == 101 else 101
@@ -701,12 +701,21 @@ class DownloadTracker:
                                         "kb_write": 0})
             else:
                 r = subprocess.run(["iostat", "-x", "1", "2"], capture_output=True, text=True, timeout=5)
-                for line in r.stdout.strip().split("\n"):
+                lines = r.stdout.strip().split("\n")
+                # iostat -x 1 2: first batch is system-average since boot, second is real 1s sample
+                # Collect only the second half of device lines (skip first batch)
+                device_lines = []
+                for line in lines:
                     parts = line.split()
-                    if len(parts) >= 12 and (parts[0].startswith("sd") or parts[0].startswith("nvme")):
-                        out.append({"device": parts[0],
-                                    "kb_read": float(parts[5]) / 2 if len(parts) > 5 else 0,
-                                    "kb_write": float(parts[9]) / 2 if len(parts) > 9 else 0})
+                    if len(parts) >= 12 and (parts[0].startswith("sd") or parts[0].startswith("nvme") or parts[0].startswith("nvm")):
+                        device_lines.append(parts)
+                # Take only the second half (the real sample, not system-average)
+                if len(device_lines) > 1:
+                    device_lines = device_lines[len(device_lines)//2:]
+                for parts in device_lines:
+                    out.append({"device": parts[0],
+                                "kb_read": float(parts[5]) if len(parts) > 5 else 0,
+                                "kb_write": float(parts[9]) if len(parts) > 9 else 0})
         except (OSError, subprocess.TimeoutExpired, FileNotFoundError):
             pass
         return out
@@ -837,14 +846,24 @@ class DownloadTracker:
                     if gmt is not None: info["gpu_mem_total"] = gmt
                     info["gpu_temp"] = _sf(parts[4])
                     if len(parts) >= 6:
-                        info["gpu_power"] = float(parts[5].strip())
+                        gpu_p = _sf(parts[5])
+                    if gpu_p is not None: info["gpu_power"] = gpu_p
             except (OSError, subprocess.TimeoutExpired, ValueError): pass
             # CPU温度 (Linux thermal zone)
             try:
                 tz_dirs = sorted(glob.glob("/sys/class/thermal/thermal_zone*"))
                 if tz_dirs:
                     max_t = 0.0
-                    for tz in tz_dirs[:4]:
+                    for tz in tz_dirs[:8]:
+                        # Skip acpitz zones (always report fixed temperature, not CPU)
+                        type_path = os.path.join(tz, "type")
+                        try:
+                            with open(type_path) as tf:
+                                tz_type = tf.read().strip()
+                            if tz_type == "acpitz":
+                                continue
+                        except (OSError, PermissionError):
+                            pass
                         with open(os.path.join(tz, "temp")) as f:
                             t = int(f.read().strip()) / 1000.0
                             if t > max_t: max_t = t
@@ -1619,10 +1638,10 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 @keyframes pulse-dot{0%,100%{opacity:1;box-shadow:0 0 6px #0f0}50%{opacity:0.65;box-shadow:0 0 14px #0f0}}
 .status-dot.offline{background:#f44;box-shadow:0 0 4px #f44}
 .sys-card{min-height:130px}
-.section-label{font-family:'Orbitron',sans-serif;font-size:11px;letter-spacing:3px;margin:10px 0 6px;padding-bottom:2px;text-shadow:0 0 8px #0ff4}
+.section-label{font-family:'Orbitron',sans-serif;font-size:12px;letter-spacing:3px;margin:10px 0 6px;padding-bottom:2px;text-shadow:0 0 8px #0ff4}
 .section-label .icon{margin-right:6px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;margin:4px 0}
-.card{background:#08081a;border:1px solid #1a1a3a;border-radius:6px;padding:8px;box-shadow:0 0 15px #0006}
+.card{background:#08081a;border:1px solid #1a1a3a;border-radius:6px;padding:8px;box-shadow:0 0 15px #0006;min-height:60px}
 .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
 .card-title{font-family:'Orbitron',sans-serif;font-size:11px;letter-spacing:1px;display:flex;align-items:center;gap:4px}
 .card-title.online{color:#0ff}.card-title.offline{color:#334}.sys-card-placeholder{border-top:2px solid #222!important;opacity:.35}
@@ -1645,7 +1664,7 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .dl-bar-fill.dl-done{background:#446}
 .dl-meta{font-size:8px;color:#556;display:flex;gap:8px}
 .pct{font-weight:bold;font-size:10px}.pct-low{color:#0ff}.pct-mid{color:#fa0}.pct-ok{color:#0f0}
-.net-card{text-align:center;padding:6px}
+.net-card{text-align:center;padding:6px;min-height:30px}
 .net-row{font-size:11px;display:flex;justify-content:center;gap:16px;align-items:center;padding:2px 0}
 .net-link{font-size:9px;color:#556;display:inline-flex;align-items:center;gap:4px;margin:0 6px}
 .net-top{border-bottom:1px solid rgba(255,170,0,.15);margin-bottom:6px;padding-bottom:4px}
@@ -1657,7 +1676,7 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .net-tb-link{font-size:8px;color:#445;text-align:center;margin:1px 0}
 .net-tb-speed{color:#556}
 .net-ping-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:5px}
-.np-card{background:rgba(10,10,26,.6);border:1px solid rgba(26,26,58,.3);border-radius:4px;padding:5px;text-align:center}
+.np-card{background:rgba(10,10,26,.6);border:1px solid rgba(26,26,58,.3);border-radius:4px;padding:5px;text-align:center;min-height:40px}
 .np-head{display:flex;align-items:center;justify-content:center;gap:4px;margin-bottom:3px}
 .np-dot{width:5px;height:5px;border-radius:50%;flex-shrink:0}
 .np-dot.s-green{background:#0f0;box-shadow:0 0 4px #0f0}
@@ -1687,7 +1706,7 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .theme-s360 .section-label.net-label .badge{color:#fa0;border:1px solid rgba(255,170,0,.3);background:rgba(255,170,0,.05)}
 .theme-s360 .section-label.dl-label .badge{color:#f4f;border:1px solid rgba(255,68,255,.3);background:rgba(255,68,255,.05)}
 .theme-s360 .section-label.job-label .badge{color:#fd0;border:1px solid rgba(255,221,0,.3);background:rgba(255,221,0,.05)}
-.job-card{border-left:3px solid #fd06;background:rgba(20,18,8,.9)}
+.job-card{border-left:3px solid #fd06;background:rgba(20,18,8,.9);min-height:50px}
 .job-card .job-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
 .job-card .job-name{font-size:10px;color:#bbc;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .job-card .job-type{font-size:7px;padding:1px 5px;border-radius:2px;margin-left:6px;flex-shrink:0}
@@ -1723,7 +1742,7 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .theme-netdata .card.net-card::before{background:#fa0;box-shadow:0 0 6px #fa06}
 .theme-netdata .card.dl-card::before{background:#f4f;box-shadow:0 0 6px #f4f6}
 .theme-netdata .card-header{border-bottom:1px solid rgba(255,255,255,.05);margin-bottom:6px;padding:0 0 4px}
-.theme-netdata .card-title{font-size:10px;letter-spacing:1px}
+.theme-netdata .card-title{font-size:10px;letter-spacing:1px;color:#0ff}
 .theme-netdata .card-ts{font-size:7px;color:#334}
 .theme-netdata .section-label{font-size:10px;border-bottom:none;display:flex;align-items:center;gap:6px;color:#556}
 .theme-netdata .section-label .swatch{display:inline-block;width:8px;height:8px;border-radius:2px}
@@ -1833,9 +1852,9 @@ body.theme-netdata .sidebar-nav .nav-item{margin:1px 4px}
 <div class="grid" id="dl-grid">{{DL_HTML}}</div>
 <div class="section-label job-label"><span class="icon">&#x23f3;</span> CONTENT PRODUCTION</div>
 <div class="grid" id="job-grid">{{JOB_HTML}}</div>
-<div class="section-label" style="font-size:11px;letter-spacing:3px;margin:10px 0 6px;color:#0f8;font-family:'Orbitron',sans-serif">&#x1f4ca; DISK I/O</div>
+<div class="section-label sys-label" style="font-size:11px;letter-spacing:3px;margin:10px 0 6px;color:#0f8;font-family:'Orbitron',sans-serif">&#x1f4ca; DISK I/O</div>
 <div class="grid" id="diskio-grid"></div>
-<div class="section-label" style="font-size:11px;letter-spacing:3px;margin:10px 0 6px;color:#0ff;font-family:'Orbitron',sans-serif">&#x1f433; DOCKER CONTAINERS</div>
+<div class="section-label sys-label" style="font-size:11px;letter-spacing:3px;margin:10px 0 6px;color:#0ff;font-family:'Orbitron',sans-serif">&#x1f433; DOCKER CONTAINERS</div>
 <div class="grid" id="docker-grid"></div>
 <div class="footer"><a href="https://github.com/kk38/dltrace" target="_blank">dltrace</a> · {{VERSION}} · {{TS}}</div>
 </div>
@@ -1923,14 +1942,14 @@ if(!any)htm='<div class="job-empty"><div class="icon">\u{1F4AD}</div><p>\u65E0\u
 _jobHtml=htm;return htm;}
 // Docker
 function dockerCard(d){var ns=d.nodes||{};var keys=Object.keys(ns);var htm='';for(var i=0;i<keys.length;i++){var h=keys[i];var n=ns[h];var dc=n.docker||n.containers;if(!dc)continue;if(typeof dc==='object'&&!Array.isArray(dc)&&dc.containers){dc=dc.containers}if(!Array.isArray(dc)||!dc.length)continue;var fn=NODE_NAMES[h]||h.split('.')[0];var run=dc.filter(function(c){return c.state==='running'}).length;var stop=dc.length-run;var summary=(run?run+' running':'')+(run&&stop?', ':'')+(stop?stop+' stopped':'')||'n/a';
-htm+='<div class="card" style="padding:8px"><div class="card-header"><span class="card-title online"><span class="status-dot online"></span>'+esc(fn)+'</span><span style="font-size:8px;color:#448">'+summary+'</span></div><div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:3px">';
+htm+='<div class="card dl-card" style="padding:8px"><div class="card-header"><span class="card-title online"><span class="status-dot online"></span>'+esc(fn)+'</span><span style="font-size:8px;color:#448">'+summary+'</span></div><div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:3px">';
 for(var j=0;j<dc.length;j++){var c=dc[j];var ctx=c.state==='running'?'#0f0;text-shadow:0 0 4px #0f0':'#f44;text-shadow:0 0 4px #f44';var ctn=c.state==='running'?'#1a1a1a':'#080812';htm+='<div style="background:'+ctn+';border:1px solid rgba(255,255,255,0.04);border-radius:3px;padding:3px 6px;font-size:8px"><span style="color:'+ctx+'" title="'+esc(c.state)+'">\u25CF</span> '+esc(c.name||c.id||'').substring(0,25)+(c.image?' <span style="color:#445">'+esc(c.image).substring(0,20)+'</span>':'')+'</div>';}
 htm+='</div></div>';}
 return htm||'<div class="empty-state"><p style="text-align:center;color:#334;font-size:10px">No Docker data</p></div>';}
 // Disk I/O
 function diskCard(d){var ns=d.nodes||{};var keys=Object.keys(ns);var htm='';for(var i=0;i<keys.length;i++){var h=keys[i];var n=ns[h];var io=n.diskio;if(!io||!Array.isArray(io)||!io.length)continue;var fn=NODE_NAMES[h]||h.split('.')[0];var totR=0,totW=0;
 for(var k=0;k<io.length;k++){totR+=io[k].kb_read||0;totW+=io[k].kb_write||0;}
-htm+='<div class="card" style="padding:8px"><div class="card-header"><span class="card-title online"><span class="status-dot online"></span>'+esc(fn)+'</span><span style="font-size:8px;color:#448">\u2191 '+fmtKb(totR)+'  \u2193 '+fmtKb(totW)+'</span></div><table style="width:100%;margin-top:4px;border-collapse:collapse;font-size:8px"><tr style="color:#556"><td style="padding:2px 4px">Device</td><td style="padding:2px 4px">Activity</td><td style="padding:2px 4px;text-align:right">R/W</td></tr>';
+htm+='<div class="card dl-card" style="padding:8px"><div class="card-header"><span class="card-title online"><span class="status-dot online"></span>'+esc(fn)+'</span><span style="font-size:8px;color:#448">\u2191 '+fmtKb(totR)+'  \u2193 '+fmtKb(totW)+'</span></div><table style="width:100%;margin-top:4px;border-collapse:collapse;font-size:8px"><tr style="color:#556"><td style="padding:2px 4px">Device</td><td style="padding:2px 4px">Activity</td><td style="padding:2px 4px;text-align:right">R/W</td></tr>';
 for(var k=0;k<io.length;k++){var dk=io[k];var r=dk.kb_read||0;var w=dk.kb_write||0;var mx=Math.max(1,totR,totW);var rp=r/mx*100;var wp=w/mx*100;
 htm+='<tr><td style="padding:1px 4px;color:#aab;white-space:nowrap">'+esc(dk.device||'')+'</td>'
 +'<td style="padding:1px 4px"><div style="display:flex;height:8px;border-radius:4px;overflow:hidden;width:50px;background:#1a1e2e">'
