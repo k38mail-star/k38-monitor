@@ -106,7 +106,10 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 # 配置常量
 # ════════════════════════════════════════════
 
-__version__ = "0.3.4"
+__version__ = "0.4.0"
+
+# Web Authentication
+DLTRACE_TOKEN = os.environ.get("DLTRACE_TOKEN", "")
 
 # ── 文件路径 ──
 PROGRESS_FILE  = "/tmp/dltrace.json"
@@ -151,6 +154,12 @@ SKIP_NAMES = {".", "..", "__pycache__", "node_modules", ".git", ".cache",
               ".npm", ".conda", ".local", ".config", "lost+found", "snap"}
 SKIP_EXTS = {".pyc", ".pyo", ".log", ".tmp", ".swp", ".lock", ".part", ".aria2"}
 SKIP_PATH_PATTERNS = [r"/\.git/", r"/miniforge3/", r"/anaconda3/", r"/snap/"]
+
+# Alert thresholds
+ALERT_GPU_TEMP_CRITICAL = 80
+alert_cpu_pct_warning = 90
+alert_disk_pct_warning = 90
+ALERT_FILE = "/tmp/dltrace_alerts.json"
 
 # 传给面板的字段白名单(增改字段只改这里)
 NODE_FIELDS = ["hostname", "ts_str", "active_files", "active_procs",
@@ -336,6 +345,8 @@ class DownloadTracker:
         self._history: dict[str, deque] = {"cpu": deque(maxlen=HISTORY_LEN), "mem": deque(maxlen=HISTORY_LEN),
                          "gpu": deque(maxlen=HISTORY_LEN), "gpu_temp": deque(maxlen=HISTORY_LEN),
                          "cpu_temp": deque(maxlen=HISTORY_LEN), "load": deque(maxlen=HISTORY_LEN)}
+        self._docker_cycle = 0
+        self._docker_cache: dict = {}
         self._history_lock = threading.Lock()  # 线程安全
         # 恢复上次会话的历史(防重启清零)
         self._load_history()
@@ -464,6 +475,90 @@ class DownloadTracker:
         except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError, PermissionError):
             pass
         return procs[:MAX_PROCESSES]
+
+    def _collect_processes(self) -> list[dict]:
+        """Collect Top 5 processes by CPU usage. macOS/Linux compatible."""
+        try:
+            import platform
+            is_mac = platform.system() == "Darwin"
+            cmd = ["ps", "-eo", "pid,%cpu,%mem,comm", "--sort=-%cpu", "--no-headers"]
+            if is_mac:
+                cmd = ["ps", "-eo", "pid,%cpu,%mem,command", "-r"]
+            out = subprocess.check_output(cmd, timeout=3, text=True)
+            lines = [l.strip() for l in out.strip().split("\n") if l.strip()]
+            procs = []
+            for line in lines[:5]:
+                parts = line.split(None, 3)
+                if len(parts) >= 4:
+                    procs.append({
+                        "pid": int(parts[0]),
+                        "cpu_pct": float(parts[1]),
+                        "mem_pct": float(parts[2]),
+                        "cmd": parts[3][:40]
+                    })
+            return procs
+        except Exception:
+            return []
+
+    def _check_alerts(self, result: dict) -> list[dict]:
+        """Check alerts against thresholds and save to ALERT_FILE.
+        Returns the list of active alerts."""
+        alerts = []
+        now = time.time()
+        ts_str = datetime.now().strftime("%H:%M:%S")
+        si = result.get("system", {}) or {}
+
+        # GPU temperature critical
+        gpu_temp = si.get("gpu_temp")
+        if gpu_temp is not None and gpu_temp > ALERT_GPU_TEMP_CRITICAL:
+            alerts.append({
+                "metric": "gpu_temp",
+                "value": gpu_temp,
+                "threshold": ALERT_GPU_TEMP_CRITICAL,
+                "severity": "critical",
+                "node": os.uname().nodename,
+            })
+
+        # CPU percentage warning
+        cpu_pct = si.get("cpu_pct")
+        if cpu_pct is not None and cpu_pct > alert_cpu_pct_warning:
+            alerts.append({
+                "metric": "cpu_pct",
+                "value": cpu_pct,
+                "threshold": alert_cpu_pct_warning,
+                "severity": "warning",
+                "node": os.uname().nodename,
+            })
+
+        # Disk percentage warning
+        disk_pct = si.get("disk_pct")
+        if disk_pct is not None and disk_pct > alert_disk_pct_warning:
+            alerts.append({
+                "metric": "disk_pct",
+                "value": disk_pct,
+                "threshold": alert_disk_pct_warning,
+                "severity": "warning",
+                "node": os.uname().nodename,
+            })
+
+        alert_payload = {
+            "ts": now,
+            "ts_str": ts_str,
+            "alerts": alerts,
+            "count": len(alerts),
+        }
+        self._save_alerts(alert_payload)
+        return alerts
+
+    def _save_alerts(self, payload: dict):
+        """Persist alerts to ALERT_FILE atomically."""
+        try:
+            tmp = ALERT_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.rename(tmp, ALERT_FILE)
+        except OSError:
+            pass
 
     # ── 网络采集（200G + TB + Ping） ──
 
@@ -849,6 +944,37 @@ class DownloadTracker:
                         gpu_p = _sf(parts[5])
                     if gpu_p is not None: info["gpu_power"] = gpu_p
             except (OSError, subprocess.TimeoutExpired, ValueError): pass
+
+            # GPU Clock (Linux/nvidia-smi)
+            try:
+                clk_out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=clocks.current.graphics,clocks.current.memory",
+                     "--format=csv,noheader,nounits"],
+                    timeout=3, text=True
+                )
+                clk_parts = clk_out.strip().split(",")
+                if len(clk_parts) >= 2:
+                    info["gpu_clk_graphics"] = float(clk_parts[0].strip())
+                    info["gpu_clk_memory"] = float(clk_parts[1].strip())
+            except Exception:
+                pass
+
+            # Fan Speed (Linux only)
+            try:
+                fans = []
+                for fpath in glob.glob("/sys/class/hwmon/hwmon*/fan*_input"):
+                    try:
+                        with open(fpath) as ff:
+                            rpm = int(ff.read().strip())
+                            fans.append(rpm)
+                    except (OSError, ValueError):
+                        pass
+                if fans:
+                    info["fan_rpm"] = fans
+                    info["fan_rpm_avg"] = int(sum(fans) / len(fans))
+            except Exception:
+                pass
+
             # CPU温度 (Linux thermal zone)
             try:
                 tz_dirs = sorted(glob.glob("/sys/class/thermal/thermal_zone*"))
@@ -970,6 +1096,21 @@ class DownloadTracker:
         elif cur:
             result["public_ip"] = cur
             result["public_loc"] = cur_loc
+        # 节点延迟矩阵
+        node_ping = []
+        for node_ip, node_name in [("192.168.3.29","三万八"),("192.168.3.46","小四"),
+                                    ("192.168.3.55","大傻"),("192.168.3.45","二傻")]:
+            try:
+                p = subprocess.run(["ping","-c","1","-W","2",node_ip],
+                    capture_output=True, text=True, timeout=3)
+                if p.returncode == 0:
+                    for line in p.stdout.split("\n"):
+                        if "time=" in line:
+                            ms = float(line.split("time=")[1].split()[0])
+                            node_ping.append({"node":node_name,"ip":node_ip,"ms":ms})
+            except:
+                pass
+        result["node_pings"] = node_ping
         # 合并而不是覆盖缓存(保留之前成功的ping)
         self.__class__._ping_cache.update(result)
         return dict(self.__class__._ping_cache)
@@ -1062,6 +1203,11 @@ class DownloadTracker:
         for k, v in GPU_TREND.items():
             gpu_trends_data[k] = list(v)
 
+        # Docker: 每10轮采一次(降频)
+        self._docker_cycle += 1
+        if self._docker_cycle % 10 == 0 or not self._docker_cache:
+            self._docker_cache = self._collect_docker()
+
         report = {
             "version": __version__,
             "ts": now,
@@ -1074,7 +1220,7 @@ class DownloadTracker:
             "tracked_total": len(self.trackers),
             "system": si,
             "gpu_trends": gpu_trends_data,
-            "docker": self._collect_docker(),
+            "docker": self._docker_cache,
             "diskio": self._collect_disk_io(),
             "ping": dict(self.__class__._ping_cache),
             "history": hist_snap,
@@ -1090,6 +1236,9 @@ class DownloadTracker:
         if self.__class__._proc_cycle >= PROC_INTERVAL:
             self.__class__._proc_cache = self._detect_processes()
             self.__class__._proc_cycle = 0
+        # Top CPU/MEM processes and alerts
+        report["top_cpu_procs"] = self._collect_processes()
+        self._check_alerts(report)
         return report
 
     def write_report(self):
@@ -1399,6 +1548,16 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
 
         def do_GET(self):
             path = self.path.split("?")[0].split("#")[0]
+            # Authentication check (skip /health)
+            if path != "/health" and DLTRACE_TOKEN:
+                auth = self.headers.get("Authorization", "")
+                if auth != f"Bearer {DLTRACE_TOKEN}":
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("WWW-Authenticate", "Bearer")
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"unauthorized"}')
+                    return
             # 健康检查: 不触发聚合查询, 防止递归死锁
             if path == "/health":
                 self.send_response(200)
@@ -1513,6 +1672,8 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                     gpu_info = (s.get("gpu_info") or "")
                     if gpu_info: card += f'<div style="width:100%;text-align:center;margin-top:2px"><span class="gpu-tag" title="{esc(gpu_info)}">{esc(gpu_info[:30])}</span></div>'
                     if s.get("load"): card += f'<div style="width:100%;text-align:center"><span class="sys-load">LD: {esc(s["load"])}</span></div>'
+                    if s.get("gpu_clk_graphics") is not None: card += f'<span class="gpu-clk">⚡ {s["gpu_clk_graphics"]}MHz 💾 {s["gpu_clk_memory"]}MHz</span>'
+                    if s.get("fan_rpm_avg") is not None: card += f'<span class="fan-speed">❄ {s["fan_rpm_avg"]} RPM</span>'
                     if s.get("uptime"): card += f'<div style="width:100%;text-align:center"><span class="sys-up">{esc(s["uptime"])}</span></div>'
                     card += "</div></div>"; sys_html += card
 
@@ -1543,6 +1704,21 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                                 f'<div class="np-pings"><span class="np-ping"><span class="np-label">百度</span><span class="np-val {bc}">{bv}</span></span>'
                                 f'<span class="np-ping"><span class="np-label">YTB</span><span class="np-val {gc}">{gv}</span></span></div>'
                                 f'<div class="np-loc">{esc(loctxt)}</div></div>')
+                # 节点间延迟矩阵
+                all_nps = []
+                for h, n in ns.items():
+                    pings = (n.get("ping") or {}).get("node_pings", [])
+                    if pings:
+                        all_nps.extend(pings)
+                # Deduplicate by node name (each node reports its own view)
+                if all_nps:
+                    net_html += '<div class="node-lat-grid">'
+                    for np in all_nps:
+                        nm = esc(np["node"])
+                        ms = np["ms"]
+                        lc = "c-green" if ms < 1 else ("c-yellow" if ms < 5 else "c-red")
+                        net_html += f'<div class="nl-cell"><span class="nl-name">{nm}</span><span class="nl-ms {lc}">{ms:.2f}ms</span></div>'
+                    net_html += '</div>'
                 net_html += '</div></div>'
                 dl_html = ""
                 total_files = 0
@@ -1650,6 +1826,8 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .sparkline{display:inline-block;margin:4px 2px 0;border-radius:4px;background:rgba(0,0,0,.2)}
 .gpu-tag{font-size:7px;color:#448;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block}
 .sys-load,.sys-up{font-size:7px;color:#445;padding:1px 4px}
+.gpu-clk{color:#0f0;font-size:8px;margin-left:6px}
+.fan-speed{color:#08f;font-size:8px;margin-left:6px}
 .empty-state{text-align:center;padding:10px 0;color:#445;font-size:10px}
 .empty-state .icon{font-size:20px}
 .dl-list{list-style:none;padding:0;margin:0}
@@ -1690,9 +1868,29 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .np-val.c-yellow{color:#fa0;text-shadow:0 0 6px #fa06}
 .np-val.c-red{color:#f44;text-shadow:0 0 6px #f46}
 .np-loc{font-size:6px;color:#334;margin-top:2px}
+.node-lat-grid{display:flex;flex-wrap:wrap;gap:3px;justify-content:center;margin-top:4px;padding-top:4px;border-top:1px solid rgba(26,26,58,.3)}
+.nl-cell{display:flex;align-items:center;gap:3px;background:rgba(10,10,26,.4);border:1px solid rgba(26,26,58,.2);border-radius:3px;padding:2px 4px}
+.nl-name{font-size:7px;color:#556}
+.nl-ms{font-size:9px;font-weight:bold;font-family:'Orbitron',sans-serif}
+.nl-ms.c-green{color:#0f0}
+.nl-ms.c-yellow{color:#fa0}
+.nl-ms.c-red{color:#f44}
 .footer{text-align:center;color:#224;font-size:9px;margin-top:10px}
 .footer a{color:#448;text-decoration:none}
 @media(max-width:600px){.grid{grid-template-columns:1fr}.header h1{font-size:16px}}
+/* Alert banner */
+.alert-banner{position:sticky;top:0;z-index:50;padding:6px 12px;margin-bottom:6px;border-radius:4px;font-size:9px;display:none;align-items:center;gap:8px;font-family:'JetBrains Mono',monospace;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:all 0.3s;cursor:pointer}
+.alert-banner.visible{display:flex}
+.alert-banner.critical{background:rgba(255,40,40,0.12);border:1px solid rgba(255,40,40,0.35);color:#f66;box-shadow:0 0 20px rgba(255,40,40,0.08)}
+.alert-banner.warning{background:rgba(255,170,0,0.10);border:1px solid rgba(255,170,0,0.30);color:#fa0;box-shadow:0 0 20px rgba(255,170,0,0.06)}
+.alert-banner .alert-count{font-weight:bold;font-size:11px;margin-right:4px}
+.alert-banner .alert-items{flex:1;display:flex;gap:10px;flex-wrap:wrap}
+.alert-banner .alert-item{display:flex;align-items:center;gap:4px}
+.alert-banner .alert-sev{font-size:7px;padding:1px 4px;border-radius:2px;text-transform:uppercase;font-weight:bold}
+.alert-banner .alert-sev.critical{background:rgba(255,40,40,0.2);color:#f44}
+.alert-banner .alert-sev.warning{background:rgba(255,170,0,0.2);color:#fa0}
+.alert-banner .alert-dismiss{opacity:0.3;cursor:pointer;font-size:12px;padding:2px 4px}
+.alert-banner .alert-dismiss:hover{opacity:0.8}
 </style>
 <style id="theme-s360">
 /* Server360 Lite: glass cards, colored section bands */
@@ -1805,6 +2003,12 @@ body.theme-netdata .sidebar-nav .nav-item{margin:1px 4px}
 </head><body>
 <canvas id="bg"></canvas><div class="scanline"></div>
 <div id="app">
+<div class="alert-banner" id="alert-banner" onclick="this.classList.remove('visible')">
+  <span class="alert-count" id="alert-count">0</span>
+  <span class="alert-label">alert(s)</span>
+  <span class="alert-items" id="alert-items"></span>
+  <span class="alert-dismiss">✖</span>
+</div>
 <div class="sidebar">
 <div class="sidebar-title">▣ K38</div>
 <div class="sidebar-nav">
@@ -1897,6 +2101,8 @@ htm+='<div style="width:100%;display:flex;gap:6px;justify-content:center;margin-
 '<div style="text-align:center"><div style="font-size:6px;color:#556">TEMP \u00b0</div>'+renderSparkline(temps,'#f60',28)+'</div>'+
 '<div style="text-align:center"><div style="font-size:6px;color:#556">PWR W</div>'+renderSparkline(powers,'#fa0',28)+'</div></div>';}}}
 if(s.gpu_info)htm+='<div style="width:100%;text-align:center;margin-top:2px"><span class="gpu-tag" title="'+esc(s.gpu_info)+'">'+esc(s.gpu_info.substring(0,30))+'</span></div>';
+if(s.gpu_clk_graphics!==undefined)htm+='<span class="gpu-clk">⚡ '+esc(s.gpu_clk_graphics)+'MHz 💾 '+esc(s.gpu_clk_memory)+'MHz</span>';
+if(s.fan_rpm_avg!==undefined)htm+='<span class="fan-speed">❄ '+esc(s.fan_rpm_avg)+' RPM</span>';
 if(s.load)htm+='<div style="width:100%;text-align:center"><span class="sys-load">LD: '+esc(s.load)+'</span></div>';
 if(s.uptime)htm+='<div style="width:100%;text-align:center"><span class="sys-up">'+esc(s.uptime)+'</span></div>';
 htm+='</div></div>';return htm;}
@@ -1918,6 +2124,8 @@ var bv=typeof b==='number'?Math.round(b):'?';var gv=typeof g==='number'?Math.rou
 var bc=typeof b==='number'?(b<50?'c-green':b<100?'c-yellow':'c-red'):'c-gray';
 var gc=typeof g==='number'?(g<100?'c-green':g<200?'c-yellow':'c-red'):'c-gray';
 htm+='<div class="np-card"><div class="np-head"><span class="np-dot '+dot+'"></span><span class="np-name">'+esc(fn)+'</span></div><div class="np-pings"><span class="np-ping"><span class="np-label">\u767e\u5ea6</span><span class="np-val '+bc+'">'+bv+'</span></span><span class="np-ping"><span class="np-label">YTB</span><span class="np-val '+gc+'">'+gv+'</span></span></div><div class="np-loc">'+esc(loc.slice(0,30))+'</div></div>';}
+// Node latency matrix
+htm+='<div class="node-lat-grid">';for(var hi=0;hi<keys.length;hi++){var hk=keys[hi];var nk=ns[hk];var nps=(nk.ping||{}).node_pings||[];for(var ni=0;ni<nps.length;ni++){var np=nps[ni];var nlc=np.ms<1?'c-green':np.ms<5?'c-yellow':'c-red';htm+='<div class="nl-cell"><span class="nl-name">'+esc(np.node)+'</span><span class="nl-ms '+nlc+'">'+np.ms.toFixed(2)+'ms</span></div>';}}
 htm+='</div></div>';return htm;}
 // Theme switching
 function switchTheme(t){localStorage.setItem('dltrace-theme',t);document.body.className='theme-'+t;document.querySelectorAll('.theme-btn,.stheme-btn').forEach(function(b){b.classList.toggle('active',b.dataset.theme===t)})}
@@ -1985,6 +2193,15 @@ var mr=document.querySelector('meta[http-equiv="refresh"]');if(mr)mr.parentNode.
 try{render({{DATA}});}catch(e){}
 (function poll(){setTimeout(function(){fetch('/api/v1/metrics').then(function(r){return r.json()}).then(function(d){render(d);poll();}).catch(function(){setTimeout(poll,POLL);});},POLL);})();
 setInterval(function(){var on=document.querySelectorAll('.status-dot.online').length;var tot=document.querySelectorAll('.sys-card').length||on;document.title=(on===tot?'\uD83D\uDFE2':'\uD83D\uDD34')+on+'/'+tot+' | K38';},3000);
+
+function renderAlerts(data){var b=$('alert-banner'),c=$('alert-count'),i=$('alert-items');if(!b||!c||!i)return;var alerts=data&&data.alerts?data.alerts:[];if(!alerts||alerts.length===0){b.classList.remove('visible');return;}
+c.textContent=alerts.length;var maxSev='warning';var items='';for(var ai=0;ai<Math.min(alerts.length,6);ai++){var a=alerts[ai];if(a.severity==='critical')maxSev='critical';items+='<span class="alert-item"><span class="alert-sev '+a.severity+'">'+a.severity+'</span>'+esc(a.metric)+'='+esc(a.value)+(a.node?' @'+esc(a.node):'')+'</span>';}
+b.className='alert-banner visible '+maxSev;i.innerHTML=items;}
+
+try{renderAlerts({{DATA}});}catch(e){}
+
+// Patch poll to also call renderAlerts
+var _origPoll=poll;poll=function(){_origPoll();setTimeout(function(){try{fetch('/api/v1/metrics').then(function(r){return r.json()}).then(function(d){renderAlerts(d);});}catch(e){}},500);};
 </script></body></html>"""
 
 
