@@ -1421,6 +1421,8 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                 def esc(s): return hlib.escape(str(s)) if s is not None else ""
                 def bar_cls(s): return "dl-done" if s in ("done","stale") else ("dl-finish" if s=="finishing" else "dl-down")
                 NODE_NAMES = {"localhost": "十六万", "192.168.3.55": "大傻 spark-9051", "192.168.3.46": "小四", "192.168.3.45": "二傻 spark-9797", "192.168.3.29": "三万八", "大傻": "大傻 spark-9051", "二傻": "二傻 spark-9797", "小四": "小四", "三万八": "三万八"}
+                NODE_KEYS = ["localhost", "192.168.3.29", "192.168.3.46", "192.168.3.55", "192.168.3.45"]
+                FIXED_NAMES = {"localhost": "十六万", "192.168.3.29": "三万八", "192.168.3.46": "小四", "192.168.3.55": "大傻", "192.168.3.45": "二傻"}
                 def tag_icon(t):
                     tl=(t or "").lower()
                     if tl.find("model")>=0 or tl.find("qwen")>=0 or tl.find("llm")>=0 or tl.find("safetensors")>=0: return "🧠"
@@ -1575,6 +1577,8 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                 html = html.replace("{{VERSION}}", __version__)
                 html = html.replace("{{TS}}", datetime.now().strftime("%H:%M:%S"))
                 html = html.replace("{{NODE_NAMES_JSON}}", json.dumps(NODE_NAMES))
+                html = html.replace("{{NODE_KEYS_JSON}}", json.dumps(NODE_KEYS))
+                html = html.replace("{{FIXED_NAMES_JSON}}", json.dumps(FIXED_NAMES))
                 html = html.replace("{{DATA}}", json.dumps(data, default=str))
                 self.wfile.write(html.encode())
 
@@ -1614,13 +1618,14 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .status-dot.online{background:#0f0;box-shadow:0 0 4px #0f0;animation:pulse-dot 2s ease-in-out infinite}
 @keyframes pulse-dot{0%,100%{opacity:1;box-shadow:0 0 6px #0f0}50%{opacity:0.65;box-shadow:0 0 14px #0f0}}
 .status-dot.offline{background:#f44;box-shadow:0 0 4px #f44}
+.sys-card{min-height:130px}
 .section-label{font-family:'Orbitron',sans-serif;font-size:11px;letter-spacing:3px;margin:10px 0 6px;padding-bottom:2px;text-shadow:0 0 8px #0ff4}
 .section-label .icon{margin-right:6px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;margin:4px 0}
 .card{background:#08081a;border:1px solid #1a1a3a;border-radius:6px;padding:8px;box-shadow:0 0 15px #0006}
 .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
-.card-title{font-family:'Orbitron',sans-serif;font-size:12px;letter-spacing:1px;display:flex;align-items:center;gap:4px}
-.card-title.online{color:#0ff}.card-title.offline{color:#334}
+.card-title{font-family:'Orbitron',sans-serif;font-size:11px;letter-spacing:1px;display:flex;align-items:center;gap:4px}
+.card-title.online{color:#0ff}.card-title.offline{color:#334}.sys-card-placeholder{border-top:2px solid #222!important;opacity:.35}
 .card-ts{font-size:8px;color:#335}
 .gg{text-align:center;min-width:52px;display:inline-block;margin:2px}
 .sparkline{display:inline-block;margin:4px 2px 0;border-radius:4px;background:rgba(0,0,0,.2)}
@@ -1855,7 +1860,8 @@ if(!_hist[id])_hist[id]=[];_hist[id].push(v);if(_hist[id].length>60)_hist[id].sh
 var sl='';if(_hist[id].length>2){var mn=Math.min.apply(null,_hist[id]),mx=Math.max.apply(null,_hist[id]);if(mn===mx){mn-=1;mx+=1}var sp=110,sh=16,rng=mx-mn,pts=[];_hist[id].forEach(function(vv,ii){var x=ii/(_hist[id].length-1)*(sp-4)+2,y=sh-2-(vv-mn)/rng*(sh-4);pts.push(x.toFixed(1)+','+y.toFixed(1));});
 sl='<svg width="'+sp+'" height="'+sh+'" style="display:block;margin:1px auto"><polyline points="'+pts.join(' ')+'" fill="none" stroke="'+c+'" stroke-width="1" opacity=".5"/></svg>';}
 return '<div class="gg">'+h+sl+'</div>';}
-function sysCard(h,n){var s=n.system||{};var nn=typeof NODE_NAMES!='undefined'?NODE_NAMES:{};var fn=nn[h]||(h.indexOf('.')>=0?h.split('.')[0]:h);
+function sysCard(h,n){if(!n)return'<div class="card sys-card sys-card-placeholder"><div class="card-header"><span class="card-title offline"><span class="status-dot offline"></span>'+esc(FIXED_NAME[h]||h)+'</span><span class="card-ts">--:--:--</span></div><div style="display:flex;flex-wrap:wrap;justify-content:center;gap:2px;color:#334;font-size:9px;text-align:center;width:100%;padding-top:20px">⚠️ 暂无数据</div></div>';}
+var s=n.system||{};var nn=typeof NODE_NAMES!='undefined'?NODE_NAMES:{};var fn=nn[h]||(h.indexOf('.')>=0?h.split('.')[0]:h);
 var dots=n.tracked_total>0||(n.ts||0)>1700000000;var dc=dots?'online':'offline';
 var htm='<div class="card sys-card" style="border-top:2px solid '+(dots?'#0ff':'#222')+'"><div class="card-header"><span class="card-title '+dc+'"><span class="status-dot '+dc+'"></span>'+esc(fn)+'</span><span class="card-ts">'+(n.ts_str||'--:--:--')+'</span></div><div style="display:flex;flex-wrap:wrap;justify-content:center;gap:2px">';
 if(s.cpu_pct!==undefined)htm+=gauge('cpu_'+h,'CPU',s.cpu_pct,'%');else if(s.load_1m!==undefined)htm+=gauge('cpu_'+h,'LD',s.load_1m,'');
@@ -1943,8 +1949,10 @@ for(var i=0;i<60;i++)pts.push({x:Math.random()*cv.width,y:Math.random()*cv.heigh
 for(var i=0;i<pts.length;i++)for(var j=i+1;j<pts.length;j++){var p=pts[i],q=pts[j],dx=p.x-q.x,dy=p.y-q.y;if(dx*dx+dy*dy<8e3){c.beginPath();c.moveTo(p.x,p.y);c.lineTo(q.x,q.y);c.stroke()}}
 for(var p of pts){p.x+=p.vx;p.y+=p.vy;if(p.x<0||p.x>cv.width)p.vx*=-1;if(p.y<0||p.y>cv.height)p.vy*=-1;c.fillStyle="#0ff";c.beginPath();c.arc(p.x,p.y,p.r,0,6.28);c.fill()}requestAnimationFrame(d)})();})();
 var NODE_NAMES={{NODE_NAMES_JSON}}
-function render(d){var ns=d.nodes||{};var keys=Object.keys(ns);var gt=d.gpu_trends||{};
-var sys='';for(var i=0;i<keys.length;i++){var gtKey=gt[keys[i]];var nn=ns[keys[i]];if(gtKey){nn.gpu_trends={};nn.gpu_trends[keys[i]]=gtKey;}sys+=sysCard(keys[i],nn);}$('sys-grid').innerHTML=sys;
+var NODE_KEYS={{NODE_KEYS_JSON}}
+var FIXED_NAME={{FIXED_NAMES_JSON}}
+function render(d){var ns=d.nodes||{};var gt=d.gpu_trends||{};
+var sys='';for(var i=0;i<NODE_KEYS.length;i++){var k=NODE_KEYS[i];var n=ns[k];var gtKey=gt[k];if(gtKey&&n){n.gpu_trends={};n.gpu_trends[k]=gtKey;}sys+=sysCard(k,n);}$('sys-grid').innerHTML=sys;
 $('net-section').innerHTML=netCard(d);
 var dl='';for(var i=0;i<keys.length;i++)dl+=dlCard(keys[i],ns[keys[i]]);$('dl-grid').innerHTML=dl;
 var jb=collectJobCards(d);$('job-grid').innerHTML=jb;
