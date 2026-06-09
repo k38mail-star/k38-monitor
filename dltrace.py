@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -124,7 +124,7 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 # 配置常量
 # ════════════════════════════════════════════
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 # Web Authentication
 DLTRACE_TOKEN = os.environ.get("DLTRACE_TOKEN", "")
@@ -1268,8 +1268,55 @@ class DownloadTracker:
         return report
 
     def write_report(self):
-        """写入JSON报告文件(原子写入防断裂)"""
+        """写入JSON报告文件(原子写入防断裂)
+        同时后台拉取远程节点数据并合并写入。
+        """
         report = self.collect()
+
+        # 后台拉取远程节点数据
+        KNOWN_NODES = _load_node_config(
+            hardcoded={
+                "三万八":    "http://192.168.3.29:8899/api/v1/metrics",
+                "小四":      "http://192.168.3.46:8899/api/v1/metrics",
+                "大傻":      "http://192.168.3.55:8899/api/v1/metrics",
+                "二傻":      "http://192.168.3.45:8899/api/v1/metrics",
+            }
+        )
+        # 远程节点: 剥离nodes桶(避免循环引用), 不包含localhost(报告本身即是)
+        nodes = {}
+
+        def _pull_node(name, url):
+            try:
+                import urllib.request
+                r = urllib.request.urlopen(url, timeout=5)
+                data = json.loads(r.read().decode())
+                if isinstance(data, dict):
+                    data.pop("nodes", None)
+                    data.pop("nodes_count", None)
+                return name, data
+            except Exception:
+                return name, None
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs = {}
+            for n, u in KNOWN_NODES.items():
+                futs[pool.submit(_pull_node, n, u)] = n
+            for future in as_completed(futs, timeout=10):
+                name = futs[future]
+                try:
+                    result = future.result()
+                    if isinstance(result, tuple) and len(result) == 2:
+                        nd_name, nd_data = result
+                        if nd_data:
+                            nodes[nd_name] = nd_data
+                except Exception:
+                    pass
+
+        # 合并远程节点数据到同一report
+        # 注意: 不包含localhost(报告本身即是, 再加会循环引用)
+        report["nodes"] = nodes
+        report["nodes_count"] = len(nodes) + 1  # +1 for localhost
+
         tmp = self.progress_file + ".tmp"
         try:
             with open(tmp, "w") as f:
@@ -1455,105 +1502,26 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
         _extra_nodes = extra_nodes
 
         def _read_all_data(self) -> dict:
-            """读取所有监控节点的数据(并行SSH, 单节点超时不阻塞)"""
-            nodes = {}
-
-            # 惰性初始化自身URL(用于跳过自引用HTTP拉取)
-            # 当绑定0.0.0.0时getsockname返回(0.0.0.0, port), 无法匹配硬编码url
-            # 所以额外检查: host是本机IP/0.0.0.0/127.0.0.1的也跳过
-            if not hasattr(self, "_self_port"):
-                try:
-                    _addr, _port = self.request.getsockname()[:2]
-                    self._self_port = _port
-                    # 收集本机所有IP(含127.0.0.1)用于自引用检测
-                    if not hasattr(self, "_self_ips"):
-                        import socket as _sk
-                        self._self_ips = set()
-                        try:
-                            self._self_ips.add(_sk.gethostbyname(_sk.gethostname()))
-                        except Exception:
-                            pass
-                        self._self_ips.add('127.0.0.1')
-                        self._self_ips.add('0.0.0.0')
-                        self._self_ips.add('localhost')
-                        if _addr:
-                            self._self_ips.add(_addr)
-                except Exception:
-                    self._self_port = None
-                    self._self_ips = set()
-
-            # 本地节点: 总是包含
+            """读取所有监控节点的数据
+            daemon已将远程节点写入report["nodes"], web handler合并localhost。
+            """
             try:
                 if os.path.exists(self._progress_file):
                     with open(self._progress_file) as f:
-                        primary_data = json.load(f)
-                    nodes["localhost"] = primary_data
+                        data = json.load(f)
+                    # 远程节点(不包含localhost以避免循环引用)
+                    remotes = data.get("nodes", {}) or {}
+                    # localhost = 报告本体
+                    local_copy = {k: v for k, v in data.items() if k != "nodes"}
+                    nodes = {"localhost": local_copy}
+                    nodes.update(remotes)
+                    return nodes
             except (json.JSONDecodeError, OSError):
-                nodes["localhost"] = {"hostname": "localhost", "ts_str": "--:--:--",
-                                        "active_files": [], "active_procs": [],
-                                        "files_count": 0, "procs_count": 0}
+                pass
 
-            # 已知所有节点的HTTP API（支持动态配置）
-            # 自动排除自身节点的HTTP拉取, 防止循环死锁
-            KNOWN_NODES = _load_node_config(
-                hardcoded={
-                    "三万八":    "http://192.168.3.29:8899/api/v1/metrics",
-                    "小四":      "http://192.168.3.46:8899/api/v1/metrics",
-                    "大傻":      "http://192.168.3.55:8899/api/v1/metrics",
-                    "二傻":      "http://192.168.3.45:8899/api/v1/metrics",
-                }
-            )
-            # 并行HTTP拉取(兼容旧数据格式)
-            def _pull_node(name, url):
-                try:
-                    import urllib.request
-                    r = urllib.request.urlopen(url, timeout=8)
-                    data = json.loads(r.read().decode())
-                    return name, data
-                except Exception:
-                    return name, {}
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                import concurrent.futures
-                futs = {}
-                for n, u in KNOWN_NODES.items():
-                    # 跳过自引用: 精确匹配URL, 或IP是本机+端口匹配
-                    _skip = False
-                    if hasattr(self, '_self_port') and self._self_port:
-                        try:
-                            _host = u.split('/')[2].split(':')[0]
-                            _port = int(u.split(':')[-1].split('/')[0])
-                            if _port == self._self_port:
-                                if _host in getattr(self, '_self_ips', set()):
-                                    _skip = True
-                        except (ValueError, IndexError):
-                            pass
-                    if not _skip and hasattr(self, '_self_url') and self._self_url:
-                        if u == self._self_url:
-                            _skip = True
-                    if _skip:
-                        continue
-                    futs[pool.submit(_pull_node, n, u)] = n
-                try:
-                    for future in concurrent.futures.as_completed(futs, timeout=12):
-                        name = futs[future]
-                        try:
-                            result = future.result()  # (name, data_dict)
-                            if isinstance(result, tuple) and len(result) == 2:
-                                nd_data = result[1]
-                            else:
-                                nd_data = result
-                            if nd_data and name not in nodes:
-                                nodes[name] = nd_data
-                        except Exception:
-                            pass
-                except concurrent.futures.TimeoutError:
-                    pass  # 总体超时不阻塞
-
-            if not nodes:
-                nodes["localhost"] = {"hostname": "localhost", "ts_str": "--:--:--",
-                                        "active_files": [], "active_procs": [],
-                                        "files_count": 0, "procs_count": 0}
-            return nodes
+            return {"localhost": {"hostname": "localhost", "ts_str": "--:--:--",
+                                    "active_files": [], "active_procs": [],
+                                    "files_count": 0, "procs_count": 0}}
 
         def _read_data(self) -> dict:
             """读取所有节点数据, 返回兼容格式"""
