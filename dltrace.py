@@ -31,6 +31,24 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
 # ── 动态节点配置 ──────────────────────────────────────────────
+# Logo data URIs for public service matrix
+LOGO_DATA = {
+    "baidu": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj42NDwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj42NDwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgohBDnEAAACk0lEQVQ4EaVTS0hUURj+7mPunWbU0Sl7OG0SM1PMRKRty1oURRRB2EOidhmkUQNiL4ImahEt2rVpLxSBWFpjgaljhmIa5jjjC3VGRkadO/cx93TOHb2ktYl+OPd1/v873/f9/wUhhKcrQNe/BqvhQS9/FHd9VkhnMGUBKmmTtL5ZISM/1L8dEGAAG6K7RyGlVVFSciBCBodU8vJVkuwsDpPDR6bJQszYkMteeGyK/gEVSppA14DhUQ3fRzQ4nTwmpw1MRPRN2YC4/mVm1kA4YqCiXIJrCwfTBMr3SVAUE6pKUFbqgMfD40OXgtoaGTnutbMZjeRyhhw/PUt8eycsyqGvadLTp7AtK9o7VsnPsEau34yRHXsmiL8lTkwzu2cxmKL0Rsd0SA4OwU8KLp7LBWP06GkC+R4B9edzYRjAl7403C6O3lVoGoEsc1kJRbtElBQ7MPBNRVWljPhiBmcvzGM8rEOgRwwMqnj+pNDKiUQN1FTLcEicpZ5jRNjT9IyBsXEd5WUSGprirDsQRQ7dvWmAZlypz8OlujwMDWs4VCsjNyfrgW3ibp9oFVxrjCMS1XG7MR+TUxlEJg0kkxm8bUtB0wn8TV6Iwrr1gN3GWDyDusvzqKyQ8OJZIaoPOi0W95u98BYIeHjXi/b3Kdy4Fad+WKQtFBug46NiaT51wg3/nUW0vl6B7OQgS0DGpHIEDi4Xj7Z3KZpHHV0LG8DhANJ0gDqDCu41b8Wxo24sUjOTyyYCD7aBSdSpBI56J/wmwTYxkTBxtWEBoX4V+6mR3gIeS0smdEqXSVimQGO0K2dO5qDF77VBGECAsmlijFZWTfSGsj32FYnw0fYyvVE6J3NzBrYXCnQKneBt3njMjPqv3/kXJUADijW0BeUAAAAASUVORK5CYII=",
+    "youtube": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAAAw0lEQVQ4EaVTiw2FIAwsL28ANpARGIEV3MAR3UBHcATcgA14LfLRgI0+SAjl6J09qMJ7Dz3j00Mm7jcLCCEx1nFvMn4N1rjdwHsXYrKAJiacZObNnIJ9JOmXxPNHNN2BimX9swSB5LsWsBbAmBoviOJfYRgAlgVgnrFOVWiniBdIiVKmqFp5gX0HGMfDBtlpDOqDrYEfkMbrce72GA8sVWBvM3gy0aih+hpJ5J/p2spYO8hGZWvEcisXgUb2E4h/hQcKPzl8hRVGXE8aAAAAAElFTkSuQmCC",
+    "github": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAB00lEQVR4nIVSTYsTQRB9ryYKiyCJ9KQ3H64egrtnz178DXvxD+jRgzf/gHhaQRYR42UVvAmKB49eRfAmiy7oQcgmk8kvyGampDrTcYi7bkEzNVX9ql6/KmLNnHPdBvlUyV2qhpiSoOrbher92Wx2XL/P+o937gVF7moFXDeSkLIcHs9m9/4psJmm3xXYtktnFRASpaqBfkzyfCfEYGDnnhn4lJbLU3XSv99tw4R4mqabQo5DQhVZnrPX693Q+fwWi+IwoDc2doqi+DKZTA59mmpgCRibTiMB9gNlE2rZ9+JoNDoCYCfa5/iKyAiqMKyY2jGgIh8AzHG2lQocRI0MK6tRAUiK4uV/wHESr1a+ao0SgBPyynkFZLFoGtsossSfMGNg/7wCJblHCcMLzxaSH5d+KHSp026/GQwGl9eBFvPePwd5LWpgWNrqJuSomsKJql6whQHwZDydPjDHe/8Iqg/rbM0ryrInYbdFhiGp+guq70OHJHlXI/Bt9e7IlhwadqVgx/vfqnrVkgQ+qcidLMumlnPO3UzIr7U1/5nl+SCIGguMs2yLwOtqVW+LSNj1qmPDYOGQBxF8qrVara2u94/7/f5qpN1u13Xa7b1ms3l9/f4fJfbNAEJQCagAAAAASUVORK5CYII=",
+    "google": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgqWsr5jAAACfElEQVQ4EXVTz0tUURT+3o9RZ0YyiSIrpNoESZSYoRmEES5D002Bk1AKZZuC8h+Qglpki2ihLiKERIlq1cIi0yJIEfwBif1QtEVClI7z8713b995k+JYHvju3HPud8797pnzgA2mtd7qum4TMex5XkKglBpi/IKcbaBnu0yqJ2mC2MzGyTm7PstYdXjTdcM07zBgOWMfkXwzAO/bFx5rWHv3I6+6BoHScqE7VNRmWdY9cfwCvK6O+z6kktbKww4kXvRDxVZgBALCgXYcGLl5CF9qRTjSDPI9FmmwbfuZTaeAnHa5KPqAyf2PYYTCCJ5pQE55hV8g/WEY7tfPyCk75vuGYVCA1c7c11KtidDewqD+ee6g/nGyXFOBhLItupTtZ7wIKGVY9t70ZZ3qhY51tawRFXeJtNZxgUOklA/Hy1CY+9ampjLRpZcnYRYCwROHfJmyxFMaLd1JRJMaJrslSLvA+eMBHyxz1NYk+p3kr0XHUJL6rwknxoLLCWApLlkZk6KjsrXyS7DgmniyMMt+ZiyUa6C7OYjeqyH0XAnhQJEJT2kUFZo+gc0cMbl0ivdrRyNuxqtxa3YOfTMvMwSuefwngznA0LSHqXlgW76Bw8VrBToNvmMLee+pvOT2SBd6Pj1F2A7idHEVKncegWmaGF2cwKsJIPW9HpGK7WitkfnQk3xwlf98FqllpD+p0tb9sUe+gqgTQ8CUHsvouQgFbNTuuoi2yjpR5XJyZZCer/YPDFzje+6CQzKyOIWB+XeY+T3HOQH2FezGqT2VqCoqZTntKqVvcJA6/OrrF/lQqGac+L8pJWeidnMjQT7nCIdkkIj9xSDjjYSMfZb9ARmRtLGfbP3kAAAAAElFTkSuQmCC",
+    "yahoo": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj40ODwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj40ODwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgrZdbzTAAABsUlEQVQ4EYWTOy9EQRTHf3d22SBRsEuEkKyCxGNVEiIaGolQ+AI+g1Yi0fgYOoXGYyMa5RZCIpZ4RSEeQWIRhffaO87suNm99orTzMx//v9zzpwzx5nu1P0hxTIOdVpTYu4XuK6FHQWhMDgOCDdDiPGwUiRFXBsozkEsDtX14kCcf7zAzXFeLBJiuCTDsgkUG4fhcpiYg6Yum8HmAlymBY/k/eFooiog6zw79wnxXmjstOIvOaeTkr48wzOjLTp68M8qqfWM2/ca5GwLrg+kBmV+XqADU7i6VmgbLJB3VyEn+G8LdJDLQvcIRKos/f4cTlO2Jv860NKyyhpIjBao++vw+uR/v3dbkoGJ3jEsrWmxlOw77K3Z/nui4lW+hd9MlT+eITVvU76/gMcrqXYJ0+p8sOl9eaUl3xzB4QZ8vglW4Q9SfPI5cCX9oSkYmLSU7UVYnS2ml+4LNZDoSnrc2lcgNff8/Dq5+8uU/BdrsjH9310B8+tM8XaW7GqGJ8gM7MwkdEYGJeoFMW1saLcDc3siWYWCpIKbgJoHpRVjQsl4UUwXrg/t1P0lznM1dzLmY98XE4KRGYksiAAAAABJRU5ErkJggg==",
+}
+
+# Services: (key, display_name, logo_key, field_name, green_thresh, yellow_thresh)
+PUBLIC_SERVICES = [
+    ("baidu", "百度", "baidu", "baidu_ms", 50, 200),
+    ("youtube", "YouTube", "youtube", "ytb_ms", 200, 500),
+    ("github", "GitHub", "github", "github_ms", 50, 200),
+    ("google", "Google", "google", "google_ms", 100, 300),
+    ("yahoo", "Yahoo", "yahoo", "yahoo_hk_ms", 50, 200),
+]
+
 def _load_node_config(hardcoded: dict) -> dict:
     """
     加载HTTP拉取的远程节点配置。
@@ -1030,7 +1048,7 @@ class DownloadTracker:
     def _collect_ping(self) -> dict:
         """采集网络延迟(Ping) + 出口IP"""
         result: dict[str, Any] = {}
-        targets = [("baidu_ms", "baidu.com"), ("ytb_ms", "www.youtube.com")]
+        targets = [("baidu_ms", "baidu.com"), ("ytb_ms", "www.youtube.com"), ("github_ms", "github.com"), ("google_ms", "google.com"), ("yahoo_hk_ms", "yahoo.com.hk")]
         # macOS -W is timeout in seconds (same as Linux), -t is TTL
         to = "-W"
         for key, host in targets:
@@ -1054,7 +1072,7 @@ class DownloadTracker:
             except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError):
                 pass
             # YouTube often blocks ICMP; fallback to curl HTTP timing
-            if not ping_ok and key == "ytb_ms":
+            if not ping_ok and key != "baidu_ms":
                 try:
                     p = subprocess.run(
                         ["curl", "-s", "-o", "/dev/null", "-w", "%{time_total}",
@@ -1710,19 +1728,6 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                     if s.get("load"): card += f'<div style="width:100%;text-align:center"><span class="sys-load">LD: {esc(s["load"])}</span></div>'
                     if s.get("gpu_clk_graphics") is not None and s.get("gpu_clk_memory") is not None: card += f'<span class="gpu-clk">⚡ {s["gpu_clk_graphics"]}MHz 💾 {s["gpu_clk_memory"]}MHz</span>'
                     if s.get("fan_rpm_avg") is not None: card += f'<span class="fan-speed">❄ {s["fan_rpm_avg"]} RPM</span>'
-                    # Public ping info (embedded from NETWORK LINKS)
-                    p = n.get("ping") or {}
-                    b = p.get("baidu_ms")
-                    g = p.get("ytb_ms")
-                    loc = p.get("public_loc", "")
-                    ping_parts = []
-                    if b is not None: ping_parts.append(f'<span style="color:#4ade80">🌐 百度 {b:.0f}ms</span>')
-                    if g is not None:
-                        gc = "#4ade80" if g < 200 else "#facc15"
-                        ping_parts.append(f'<span style="color:{gc}"> YTB {g:.0f}ms</span>')
-                    if loc: ping_parts.append(f'<span style="color:#94a3b8;margin-left:6px">📍 {esc(loc[:25])}</span>')
-                    if ping_parts:
-                        card += '<div style="width:100%;text-align:center;margin-top:3px;font-size:8px">' + " ".join(ping_parts) + '</div>'
                     card += "</div></div>"; sys_html += card
 
                 # Network section
@@ -1738,47 +1743,67 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                 # 5×5 延迟矩阵
                 m_keys = list(ns.keys())
                 if m_keys:
-                    # Build matrix: source → target → ms
-                    matrix = {}
-                    def short_label(s): i=s.find(' '); return s[:i] if i>0 else s
-                    nn_map = NODE_NAMES
-                    # Build matrix keyed by short label (matches ping data)
-                    matrix = {}
-                    m_labels = []
+                    # ====== NEW: Public service ping matrix ======
+                    net_html += '<div class="tog ex" onclick="toggleMatrix(this)"><span class="tog-i">\u25b6</span><span class="tog-t">\u516c\u7f51\u5ef6\u8fdf</span><span class="tog-b">5\u00d75</span><span class="leg"><span class="leg-i"><span class="leg-d" style="background:rgba(34,197,94,.5)"></span>&lt;50ms</span><span class="leg-i"><span class="leg-d" style="background:rgba(234,179,8,.5)"></span>50-200ms</span><span class="leg-i"><span class="leg-d" style="background:rgba(239,68,68,.5)"></span>&gt;200ms</span></span></div>'
+                    net_html += '<div class="net-matrix-wrap open"><div class="pg-grid">'
+                    # Column headers: empty + services + location
+                    net_html += '<div></div>'
+                    net_html += '<div class="ph"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj42NDwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj42NDwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgohBDnEAAACk0lEQVQ4EaVTS0hUURj+7mPunWbU0Sl7OG0SM1PMRKRty1oURRRB2EOidhmkUQNiL4ImahEt2rVpLxSBWFpjgaljhmIa5jjjC3VGRkadO/cx93TOHb2ktYl+OPd1/v873/f9/wUhhKcrQNe/BqvhQS9/FHd9VkhnMGUBKmmTtL5ZISM/1L8dEGAAG6K7RyGlVVFSciBCBodU8vJVkuwsDpPDR6bJQszYkMteeGyK/gEVSppA14DhUQ3fRzQ4nTwmpw1MRPRN2YC4/mVm1kA4YqCiXIJrCwfTBMr3SVAUE6pKUFbqgMfD40OXgtoaGTnutbMZjeRyhhw/PUt8eycsyqGvadLTp7AtK9o7VsnPsEau34yRHXsmiL8lTkwzu2cxmKL0Rsd0SA4OwU8KLp7LBWP06GkC+R4B9edzYRjAl7403C6O3lVoGoEsc1kJRbtElBQ7MPBNRVWljPhiBmcvzGM8rEOgRwwMqnj+pNDKiUQN1FTLcEicpZ5jRNjT9IyBsXEd5WUSGprirDsQRQ7dvWmAZlypz8OlujwMDWs4VCsjNyfrgW3ibp9oFVxrjCMS1XG7MR+TUxlEJg0kkxm8bUtB0wn8TV6Iwrr1gN3GWDyDusvzqKyQ8OJZIaoPOi0W95u98BYIeHjXi/b3Kdy4Fad+WKQtFBug46NiaT51wg3/nUW0vl6B7OQgS0DGpHIEDi4Xj7Z3KZpHHV0LG8DhANJ0gDqDCu41b8Wxo24sUjOTyyYCD7aBSdSpBI56J/wmwTYxkTBxtWEBoX4V+6mR3gIeS0smdEqXSVimQGO0K2dO5qDF77VBGECAsmlijFZWTfSGsj32FYnw0fYyvVE6J3NzBrYXCnQKneBt3njMjPqv3/kXJUADijW0BeUAAAAASUVORK5CYII=" alt="百度" class="pgi"><span class="sn">百度</span></div>'
+                    net_html += '<div class="ph"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAAAw0lEQVQ4EaVTiw2FIAwsL28ANpARGIEV3MAR3UBHcATcgA14LfLRgI0+SAjl6J09qMJ7Dz3j00Mm7jcLCCEx1nFvMn4N1rjdwHsXYrKAJiacZObNnIJ9JOmXxPNHNN2BimX9swSB5LsWsBbAmBoviOJfYRgAlgVgnrFOVWiniBdIiVKmqFp5gX0HGMfDBtlpDOqDrYEfkMbrce72GA8sVWBvM3gy0aih+hpJ5J/p2spYO8hGZWvEcisXgUb2E4h/hQcKPzl8hRVGXE8aAAAAAElFTkSuQmCC" alt="YouTube" class="pgi"><span class="sn">YouTube</span></div>'
+                    net_html += '<div class="ph"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABRUlEQVR4nIVSW3LCMAxcOS5cAJLS3P9W/JdgX4AMtjorbNC0TKMZ4sTsrh4rUVWFi5wz7qoQVaiI3fX3KILD4eDhEC+w5AytFdKIv4PQGgK+nEjoL5eUiHhLfAoAGFQfWC9wyRlvc1KwifIp7iTHBFJKkFqtPMbnOOK+rigA7jE+fusKlGL/mQhnVCvIjQRazxxUSzzP8z99NJSIJQniLqi6FaygD5nc8LQKQBmGTQHvOrnBT/5jwwVGjdGq7e2E/mEeb9KBwFn1VlmBtqy9r+/rFefz+Q+Rd8uyWNaONTdSSlqa3+axCGoTPY2jnUYkyRO5VCEg2G6zpA6gGzwLTXLh1rvbTq5t4jRNqBRxmxfCc8sxNHe8A+QYrl+cpsla6Ktqgi6j+d+8n47H11B9lex5HyNKrSiuhdvtBs5pv9thbHPp8QOVn7yjFD03pQAAAABJRU5ErkJggg==" alt="GitHub" class="pgi"><span class="sn">GitHub</span></div>'
+                    net_html += '<div class="ph"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgqWsr5jAAACfElEQVQ4EXVTz0tUURT+3o9RZ0YyiSIrpNoESZSYoRmEES5D002Bk1AKZZuC8h+Qglpki2ihLiKERIlq1cIi0yJIEfwBif1QtEVClI7z8713b995k+JYHvju3HPud8797pnzgA2mtd7qum4TMex5XkKglBpi/IKcbaBnu0yqJ2mC2MzGyTm7PstYdXjTdcM07zBgOWMfkXwzAO/bFx5rWHv3I6+6BoHScqE7VNRmWdY9cfwCvK6O+z6kktbKww4kXvRDxVZgBALCgXYcGLl5CF9qRTjSDPI9FmmwbfuZTaeAnHa5KPqAyf2PYYTCCJ5pQE55hV8g/WEY7tfPyCk75vuGYVCA1c7c11KtidDewqD+ee6g/nGyXFOBhLItupTtZ7wIKGVY9t70ZZ3qhY51tawRFXeJtNZxgUOklA/Hy1CY+9ampjLRpZcnYRYCwROHfJmyxFMaLd1JRJMaJrslSLvA+eMBHyxz1NYk+p3kr0XHUJL6rwknxoLLCWApLlkZk6KjsrXyS7DgmniyMMt+ZiyUa6C7OYjeqyH0XAnhQJEJT2kUFZo+gc0cMbl0ivdrRyNuxqtxa3YOfTMvMwSuefwngznA0LSHqXlgW76Bw8VrBToNvmMLee+pvOT2SBd6Pj1F2A7idHEVKncegWmaGF2cwKsJIPW9HpGK7WitkfnQk3xwlf98FqllpD+p0tb9sUe+gqgTQ8CUHsvouQgFbNTuuoi2yjpR5XJyZZCer/YPDFzje+6CQzKyOIWB+XeY+T3HOQH2FezGqT2VqCoqZTntKqVvcJA6/OrrF/lQqGac+L8pJWeidnMjQT7nCIdkkIj9xSDjjYSMfZb9ARmRtLGfbP3kAAAAAElFTkSuQmCC" alt="Google" class="pgi"><span class="sn">Google</span></div>'
+                    net_html += '<div class="ph"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj40ODwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj40ODwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgrZdbzTAAABsUlEQVQ4EYWTOy9EQRTHf3d22SBRsEuEkKyCxGNVEiIaGolQ+AI+g1Yi0fgYOoXGYyMa5RZCIpZ4RSEeQWIRhffaO87suNm99orTzMx//v9zzpwzx5nu1P0hxTIOdVpTYu4XuK6FHQWhMDgOCDdDiPGwUiRFXBsozkEsDtX14kCcf7zAzXFeLBJiuCTDsgkUG4fhcpiYg6Yum8HmAlymBY/k/eFooiog6zw79wnxXmjstOIvOaeTkr48wzOjLTp68M8qqfWM2/ca5GwLrg+kBmV+XqADU7i6VmgbLJB3VyEn+G8LdJDLQvcIRKos/f4cTlO2Jv860NKyyhpIjBao++vw+uR/v3dbkoGJ3jEsrWmxlOw77K3Z/nui4lW+hd9MlT+eITVvU76/gMcrqXYJ0+p8sOl9eaUl3xzB4QZ8vglW4Q9SfPI5cCX9oSkYmLSU7UVYnS2ml+4LNZDoSnrc2lcgNff8/Dq5+8uU/BdrsjH9310B8+tM8XaW7GqGJ8gM7MwkdEYGJeoFMW1saLcDc3siWYWCpIKbgJoHpRVjQsl4UUwXrg/t1P0lznM1dzLmY98XE4KRGYksiAAAAABJRU5ErkJggg==" alt="Yahoo" class="pgi"><span class="sn">Yahoo</span></div>'
+                    net_html += '<div class="ph"><svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 1C5.24 1 3 3.24 3 6c0 3.75 5 9 5 9s5-5.25 5-9c0-2.76-2.24-5-5-5z" fill="#ef4444"/><circle cx="8" cy="6" r="2" fill="#fff"/></svg><span class="sn">位置</span></div>'
+                    # Data rows: one per node
                     for h in m_keys:
-                        full = nn_map.get(h, h.split(".")[0] if "." in h else h)
-                        lb = short_label(full)
-                        m_labels.append(lb)
                         n = ns[h]
-                        nps = (n.get("ping") or {}).get("node_pings", [])
-                        matrix[lb] = {}
-                        for np in nps:
-                            matrix[lb][np["node"]] = np["ms"]
-                    net_html += '<div class="net-toggle" onclick="toggleMatrix(this)"><span class="net-toggle-icon">▶</span>延迟矩阵 <span class="net-toggle-badge">5×5</span></div><div class="net-matrix-wrap open"><div class="node-lat-grid">'
-                    # Column headers
-                    net_html += '<div class="nl-cell col-header"></div>'
-                    for lb in m_labels:
-                        net_html += f'<div class="nl-cell col-header">{esc(lb)}</div>'
-                    # Data rows
-                    for si, sh in enumerate(m_keys):
-                        sdn = m_labels[si]
-                        net_html += f'<div class="nl-cell row-header">{esc(sdn)}</div>'
-                        for ti, th in enumerate(m_keys):
-                            tdn = m_labels[ti]
-                            if sdn == tdn:
-                                net_html += '<div class="nl-cell"><span class="nl-self">·</span></div>'
-                                continue
-                            mv = (matrix.get(sdn) or {}).get(tdn)
-                            if mv is not None:
-                                mc = "c-green" if mv < 0.5 else ("c-yellow" if mv < 3 else "c-red")
-                                bg = (f"rgba(34,197,94,{0.15+0.35*max(0,1-mv/0.5)})" if mv < 0.5
-                                      else "rgba(234,179,8,0.15)" if mv < 3
-                                      else "rgba(239,68,68,0.15)")
-                                net_html += f'<div class="nl-cell" style="background:{bg}"><span class="nl-ms {mc}">{mv:.2f}</span></div>'
-                            else:
-                                net_html += '<div class="nl-cell"><span class="nl-self">?</span></div>'
-                    # Legend
-                    net_html += '<div class="nl-legend"><span class="nl-legend-item"><span class="nl-dot" style="background:rgba(34,197,94,0.4)"></span>&lt;0.5ms</span><span class="nl-legend-item"><span class="nl-dot" style="background:rgba(234,179,8,0.4)"></span>0.5-3ms</span><span class="nl-legend-item"><span class="nl-dot" style="background:rgba(239,68,68,0.4)"></span>&gt;3ms</span></div>'
+                        fn = NODE_NAMES.get(h, h.split(".")[0] if "." in h else h)
+                        sp = fn.find(" ")
+                        if sp > 0: fn = fn[:sp]
+                        net_html += f'<div class="pr">{esc(fn)}</div>'
+                        # Baidu
+                        val = (n.get("ping") or {}).get("baidu_ms")
+                        if val is not None:
+                            c = "rgba(34,197,94,0.15)" if val < 50 else ("rgba(234,179,8,0.15)" if val < 200 else "rgba(239,68,68,0.15)")
+                            tc = "rgba(34,197,94,.9)" if val < 50 else ("rgba(234,179,8,.9)" if val < 200 else "rgba(239,68,68,.9)")
+                            net_html += f'<div style="background:{c};color:{tc};font-weight:bold">{int(val)}ms</div>'
+                        else:
+                            net_html += '<div class="na">N/A</div>'
+                        # YouTube
+                        val = (n.get("ping") or {}).get("ytb_ms")
+                        if val is not None:
+                            c = "rgba(34,197,94,0.15)" if val < 200 else ("rgba(234,179,8,0.15)" if val < 500 else "rgba(239,68,68,0.15)")
+                            tc = "rgba(34,197,94,.9)" if val < 200 else ("rgba(234,179,8,.9)" if val < 500 else "rgba(239,68,68,.9)")
+                            net_html += f'<div style="background:{c};color:{tc};font-weight:bold">{int(val)}ms</div>'
+                        else:
+                            net_html += '<div class="na">N/A</div>'
+                        # GitHub
+                        val = (n.get("ping") or {}).get("github_ms")
+                        if val is not None:
+                            c = "rgba(34,197,94,0.15)" if val < 50 else ("rgba(234,179,8,0.15)" if val < 200 else "rgba(239,68,68,0.15)")
+                            tc = "rgba(34,197,94,.9)" if val < 50 else ("rgba(234,179,8,.9)" if val < 200 else "rgba(239,68,68,.9)")
+                            net_html += f'<div style="background:{c};color:{tc};font-weight:bold">{int(val)}ms</div>'
+                        else:
+                            net_html += '<div class="na">N/A</div>'
+                        # Google
+                        val = (n.get("ping") or {}).get("google_ms")
+                        if val is not None:
+                            c = "rgba(34,197,94,0.15)" if val < 100 else ("rgba(234,179,8,0.15)" if val < 300 else "rgba(239,68,68,0.15)")
+                            tc = "rgba(34,197,94,.9)" if val < 100 else ("rgba(234,179,8,.9)" if val < 300 else "rgba(239,68,68,.9)")
+                            net_html += f'<div style="background:{c};color:{tc};font-weight:bold">{int(val)}ms</div>'
+                        else:
+                            net_html += '<div class="na">N/A</div>'
+                        # Yahoo
+                        val = (n.get("ping") or {}).get("yahoo_hk_ms")
+                        if val is not None:
+                            c = "rgba(34,197,94,0.15)" if val < 50 else ("rgba(234,179,8,0.15)" if val < 200 else "rgba(239,68,68,0.15)")
+                            tc = "rgba(34,197,94,.9)" if val < 50 else ("rgba(234,179,8,.9)" if val < 200 else "rgba(239,68,68,.9)")
+                            net_html += f'<div style="background:{c};color:{tc};font-weight:bold">{int(val)}ms</div>'
+                        else:
+                            net_html += '<div class="na">N/A</div>'
+                        # Location
+                        loc = (n.get("ping") or {}).get("public_loc", "")
+                        net_html += f'<div style="color:#667;font-size:6px">{esc(loc[:12])}</div>'
                     net_html += '</div></div>'
                 net_html += '</div>'
                 dl_html = ""
@@ -1929,25 +1954,27 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .np-val.c-yellow{color:#fa0;text-shadow:0 0 6px #fa06}
 .np-val.c-red{color:#f44;text-shadow:0 0 6px #f46}
 .np-loc{font-size:6px;color:#334;margin-top:2px}
-.node-lat-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:2px;margin-top:4px;padding-top:4px;max-height:170px;overflow-y:auto}
-.net-toggle{cursor:pointer;display:flex;align-items:center;gap:6px;padding:4px 6px;margin-top:4px;border-top:1px solid rgba(26,26,58,.3);font-size:9px;color:#556;user-select:none}
-.net-toggle:hover{color:#889;background:rgba(26,26,58,.1);border-radius:3px}
-.net-toggle-icon{font-size:7px;transition:transform .2s;display:inline-block}
-.net-toggle.open .net-toggle-icon{transform:rotate(90deg)}
-.net-toggle-badge{font-size:7px;color:#445;background:rgba(26,26,58,.3);padding:1px 4px;border-radius:2px;margin-left:auto}
+.pg-grid{display:grid;gap:2px;margin-top:3px;padding-top:3px;grid-template-columns:44px repeat(6,1fr)}
+.pg-grid>div{padding:3px 2px;font-size:7px;text-align:center;border-radius:2px;display:flex;align-items:center;justify-content:center;min-height:18px}
+.ph{color:#445;font-size:7px;font-weight:bold;background:rgba(26,26,58,.3);padding:3px 2px;flex-direction:column;gap:1px}
+.ph img.pgi{width:14px;height:14px;border-radius:2px}
+.ph .sn{color:#667;font-size:6px;margin-top:1px;max-width:40px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pr{color:#667;font-size:7px;font-weight:bold;background:rgba(26,26,58,.2);padding:3px 3px;text-align:right;justify-content:flex-end;white-space:nowrap}
+.na{color:#334;font-size:6px}
+.tog{display:flex;align-items:center;gap:4px;padding:3px 5px;margin-top:3px;border-top:1px solid rgba(26,26,58,.3);cursor:pointer;user-select:none;transition:all .2s;border-radius:3px}
+.tog:hover{background:rgba(0,255,255,.04)}
+.tog-i{font-size:6px;transition:transform .2s;color:#556;display:inline-block}
+.tog-t{font-size:8px;color:#556;letter-spacing:1px}
+.tog-b{font-size:6px;color:#445;background:rgba(26,26,58,.3);padding:1px 3px;border-radius:2px}
+.tog.ex{background:rgba(0,255,255,.05);border-top-color:rgba(0,255,255,.15)}
+.tog.ex .tog-i{color:#0ff;transform:rotate(90deg)}
+.tog.ex .tog-t{color:#0ff}
+.tog.ex .tog-b{color:#0ff;background:rgba(0,255,255,.1)}
+.leg{margin-left:auto;display:flex;gap:5px;align-items:center}
+.leg-i{display:flex;align-items:center;gap:2px;font-size:6px;color:#445}
+.leg-d{width:4px;height:4px;border-radius:50%;display:inline-block}
 .net-matrix-wrap{display:none}
 .net-matrix-wrap.open{display:block}
-.nl-cell{text-align:center;background:rgba(10,10,26,.4);border:1px solid rgba(26,26,58,.2);border-radius:3px;padding:2px 0;font-size:9px;font-family:'Orbitron',sans-serif;min-height:22px;display:flex;flex-direction:column;align-items:center;justify-content:center}
-.nl-cell.col-header{background:transparent;border:none;color:#556;font-size:7px;font-family:inherit;min-height:auto}
-.nl-cell.row-header{background:transparent;border:none;color:#889;font-size:7px;font-family:inherit;min-height:auto}
-.nl-ms{font-weight:bold;font-size:9px}
-.nl-ms.c-green{color:#0f0;text-shadow:0 0 4px #0f04}
-.nl-ms.c-yellow{color:#fa0;text-shadow:0 0 4px #fa04}
-.nl-ms.c-red{color:#f44;text-shadow:0 0 4px #f44}
-.nl-self{color:#334;font-size:7px}
-.nl-legend{display:flex;gap:10px;justify-content:center;margin-top:4px;font-size:7px;color:#556;font-family:inherit}
-.nl-legend-item{display:flex;align-items:center;gap:3px}
-.nl-dot{width:6px;height:6px;border-radius:50%;display:inline-block}
 .footer{text-align:center;color:#224;font-size:9px;margin-top:10px}
 .footer a{color:#448;text-decoration:none}
 @media(max-width:600px){.grid{grid-template-columns:1fr}.header h1{font-size:16px}}
@@ -2178,13 +2205,6 @@ if(s.gpu_clk_graphics!==undefined&&s.gpu_clk_memory!==undefined)htm+='<span clas
 if(s.fan_rpm_avg!==undefined)htm+='<span class="fan-speed">❄ '+esc(s.fan_rpm_avg)+' RPM</span>';
 if(s.load)htm+='<div style="width:100%;text-align:center"><span class="sys-load">LD: '+esc(s.load)+'</span></div>';
 if(s.uptime)htm+='<div style="width:100%;text-align:center"><span class="sys-up">'+esc(s.uptime)+'</span></div>';
-// Public ping info (embedded from NETWORK LINKS)
-var p=n.ping||{};var b=p.baidu_ms,g=p.ytb_ms,loc=p.public_loc||'';
-if(b!==undefined||g!==undefined||loc){htm+='<div style="width:100%;text-align:center;margin-top:3px;font-size:8px">';
-if(b!==undefined)htm+='<span style="color:#4ade80">🌐 百度 '+Math.round(b)+'ms</span>';
-if(g!==undefined)htm+='<span style="color:'+(g<200?'#4ade80':'#facc15')+'"> YTB '+Math.round(g)+'ms</span>';
-if(loc)htm+='<span style="color:#94a3b8;margin-left:6px">📍 '+esc(loc.slice(0,25))+'</span>';
-htm+='</div>';}
 htm+='</div></div>';return htm;}
 function dlCard(h,n){var f=n.active_files||[];var nn=typeof NODE_NAMES!='undefined'?NODE_NAMES:{};var fn=nn[h]||(h.indexOf('.')>=0?h.split('.')[0]:h);
 var dots=n.tracked_total>0||(n.ts||0)>1700000000;var dc=dots?'online':'offline';
@@ -2194,29 +2214,55 @@ for(var i=0;i<f.length;i++){var ff=f[i];var p=ff.pct||0;var sz=ff.size_mb||0;var
 htm+='<li class="dl-item"><div class="dl-row"><span>'+ic+'</span><span class="dl-name" title="'+esc(nm)+'">'+esc(nm)+'</span><span class="pct '+pctCls(p)+'">'+p+'%</span></div><div class="dl-bar"><div class="dl-bar-fill '+bc+'" style="width:'+p+'%"></div></div><div class="dl-meta"><span>'+sz.toFixed(1)+' MB</span><span class="speed">'+(sp>0?sp.toFixed(2)+' MB/s':'')+'</span><span>'+st+'</span></div></li>';}
 htm+='</ul>'}else{htm+='<div class="empty-state"><div class="icon">\uD83D\uDCED</div><p>\u65E0\u6D3B\u8DC3\u4E0B\u8F7D</p></div>';}
 htm+='</div>';return htm;}
+var LOGOS={"baidu": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj42NDwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj42NDwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgohBDnEAAACk0lEQVQ4EaVTS0hUURj+7mPunWbU0Sl7OG0SM1PMRKRty1oURRRB2EOidhmkUQNiL4ImahEt2rVpLxSBWFpjgaljhmIa5jjjC3VGRkadO/cx93TOHb2ktYl+OPd1/v873/f9/wUhhKcrQNe/BqvhQS9/FHd9VkhnMGUBKmmTtL5ZISM/1L8dEGAAG6K7RyGlVVFSciBCBodU8vJVkuwsDpPDR6bJQszYkMteeGyK/gEVSppA14DhUQ3fRzQ4nTwmpw1MRPRN2YC4/mVm1kA4YqCiXIJrCwfTBMr3SVAUE6pKUFbqgMfD40OXgtoaGTnutbMZjeRyhhw/PUt8eycsyqGvadLTp7AtK9o7VsnPsEau34yRHXsmiL8lTkwzu2cxmKL0Rsd0SA4OwU8KLp7LBWP06GkC+R4B9edzYRjAl7403C6O3lVoGoEsc1kJRbtElBQ7MPBNRVWljPhiBmcvzGM8rEOgRwwMqnj+pNDKiUQN1FTLcEicpZ5jRNjT9IyBsXEd5WUSGprirDsQRQ7dvWmAZlypz8OlujwMDWs4VCsjNyfrgW3ibp9oFVxrjCMS1XG7MR+TUxlEJg0kkxm8bUtB0wn8TV6Iwrr1gN3GWDyDusvzqKyQ8OJZIaoPOi0W95u98BYIeHjXi/b3Kdy4Fad+WKQtFBug46NiaT51wg3/nUW0vl6B7OQgS0DGpHIEDi4Xj7Z3KZpHHV0LG8DhANJ0gDqDCu41b8Wxo24sUjOTyyYCD7aBSdSpBI56J/wmwTYxkTBxtWEBoX4V+6mR3gIeS0smdEqXSVimQGO0K2dO5qDF77VBGECAsmlijFZWTfSGsj32FYnw0fYyvVE6J3NzBrYXCnQKneBt3njMjPqv3/kXJUADijW0BeUAAAAASUVORK5CYII=", "youtube": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAAAw0lEQVQ4EaVTiw2FIAwsL28ANpARGIEV3MAR3UBHcATcgA14LfLRgI0+SAjl6J09qMJ7Dz3j00Mm7jcLCCEx1nFvMn4N1rjdwHsXYrKAJiacZObNnIJ9JOmXxPNHNN2BimX9swSB5LsWsBbAmBoviOJfYRgAlgVgnrFOVWiniBdIiVKmqFp5gX0HGMfDBtlpDOqDrYEfkMbrce72GA8sVWBvM3gy0aih+hpJ5J/p2spYO8hGZWvEcisXgUb2E4h/hQcKPzl8hRVGXE8aAAAAAElFTkSuQmCC", "github": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgqWsr5jAAACQElEQVQ4EXVSS2sTURS+50yiJplogzOdvNBNdi6CiojQnY9SHxtRwR+guHDXRTeWoi5dCG4Ltv6GLERc2o1SK9WNUOhGYzPJNBXUCM3MvX5nOtEY0gNn7nl93/3m3ktqxBzHyaeIZgzRHTLmtLQRv0e8GBrzMgiCH8MQGk48x7lGzA+NMSeH64OYiD6w1gvfgqAxqFmDoOi69xXRcwxVBrXRlYlKWqkb+Vxu52ev9076MUHRca5A5hLyAASLWCfgLgi34T3EGUjdQLyM9bgRkmx2DSQb5LquDeYVNOqQ/trvdC5VKpWjZnf3GEVRB2DAM04URc1Wq9XxXLeBTa6CZF0bM5WChMsA1sGuQAKFymo2m9tYxQf2NQkwRDKDkzV1wTKk300KyjC/QBzF+fiPwc5L2HAPAizjek5JhlLfiqK18bh/VchfR/ZLKoJlSEolbatPlEnifRcOw0OQn44HgGUkq5KAmRn/tC8yaWiiaUweiFNgrbxth5B/HYXv8LOHbXuzWCptdrvd/86iVqsdTKfTM5h5As/BFW5vnuTpWkRvIeELbmEFB/QIDfnPua12+5UMep53Hkofw88gxUsnObOPkdZTHL9t5jk0L8J34LdB8kZZ1mcBJ9ZG/Rzi+LzQD7HhA8Hit5Xyfb/BzLMozsNPoLSqtQ6kJ4ZHJPFv2RnWh88KRpKYQIIt33+K9j34TchbBqEjdTHsyKil4J/wbm7htT7b64z5FgqFI2XPu1CtVv9eablczpYmJ6cnYKOQP8GM3/4taKC9AAAAAElFTkSuQmCC", "google": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgqWsr5jAAACfElEQVQ4EXVTz0tUURT+3o9RZ0YyiSIrpNoESZSYoRmEES5D002Bk1AKZZuC8h+Qglpki2ihLiKERIlq1cIi0yJIEfwBif1QtEVClI7z8713b995k+JYHvju3HPud8797pnzgA2mtd7qum4TMex5XkKglBpi/IKcbaBnu0yqJ2mC2MzGyTm7PstYdXjTdcM07zBgOWMfkXwzAO/bFx5rWHv3I6+6BoHScqE7VNRmWdY9cfwCvK6O+z6kktbKww4kXvRDxVZgBALCgXYcGLl5CF9qRTjSDPI9FmmwbfuZTaeAnHa5KPqAyf2PYYTCCJ5pQE55hV8g/WEY7tfPyCk75vuGYVCA1c7c11KtidDewqD+ee6g/nGyXFOBhLItupTtZ7wIKGVY9t70ZZ3qhY51tawRFXeJtNZxgUOklA/Hy1CY+9ampjLRpZcnYRYCwROHfJmyxFMaLd1JRJMaJrslSLvA+eMBHyxz1NYk+p3kr0XHUJL6rwknxoLLCWApLlkZk6KjsrXyS7DgmniyMMt+ZiyUa6C7OYjeqyH0XAnhQJEJT2kUFZo+gc0cMbl0ivdrRyNuxqtxa3YOfTMvMwSuefwngznA0LSHqXlgW76Bw8VrBToNvmMLee+pvOT2SBd6Pj1F2A7idHEVKncegWmaGF2cwKsJIPW9HpGK7WitkfnQk3xwlf98FqllpD+p0tb9sUe+gqgTQ8CUHsvouQgFbNTuuoi2yjpR5XJyZZCer/YPDFzje+6CQzKyOIWB+XeY+T3HOQH2FezGqT2VqCoqZTntKqVvcJA6/OrrF/lQqGac+L8pJWeidnMjQT7nCIdkkIj9xSDjjYSMfZb9ARmRtLGfbP3kAAAAAElFTkSuQmCC", "yahoo": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj40ODwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj40ODwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgrZdbzTAAABsUlEQVQ4EYWTOy9EQRTHf3d22SBRsEuEkKyCxGNVEiIaGolQ+AI+g1Yi0fgYOoXGYyMa5RZCIpZ4RSEeQWIRhffaO87suNm99orTzMx//v9zzpwzx5nu1P0hxTIOdVpTYu4XuK6FHQWhMDgOCDdDiPGwUiRFXBsozkEsDtX14kCcf7zAzXFeLBJiuCTDsgkUG4fhcpiYg6Yum8HmAlymBY/k/eFooiog6zw79wnxXmjstOIvOaeTkr48wzOjLTp68M8qqfWM2/ca5GwLrg+kBmV+XqADU7i6VmgbLJB3VyEn+G8LdJDLQvcIRKos/f4cTlO2Jv860NKyyhpIjBao++vw+uR/v3dbkoGJ3jEsrWmxlOw77K3Z/nui4lW+hd9MlT+eITVvU76/gMcrqXYJ0+p8sOl9eaUl3xzB4QZ8vglW4Q9SfPI5cCX9oSkYmLSU7UVYnS2ml+4LNZDoSnrc2lcgNff8/Dq5+8uU/BdrsjH9310B8+tM8XaW7GqGJ8gM7MwkdEYGJeoFMW1saLcDc3siWYWCpIKbgJoHpRVjQsl4UUwXrg/t1P0lznM1dzLmY98XE4KRGYksiAAAAABJRU5ErkJggg=="};
+var PUBLIC_SERVICES=[
+  ["baidu","百度","baidu_ms",50,200],
+  ["youtube","YouTube","ytb_ms",200,500],
+  ["github","GitHub","github_ms",50,200],
+  ["google","Google","google_ms",100,300],
+  ["yahoo","Yahoo","yahoo_hk_ms",50,200],
+];
 function netCard(c){var ns=c.nodes||{};var lk=c.network||{};var l200=lk.link200||{};var lkc=l200.up?'#0f0':'#f44';var lkt=l200.latency?l200.latency.toFixed(2)+'ms':(l200.up===false?'DOWN':'...');
-var htm='<div class="card net-card"><div class="net-top"><div class="net-200g"><span class="net-200g-icon">\u26a1</span><span class="net-200g-label">200G</span><span class="net-200g-nodes">'+esc(l200.link200_nodes||'spark-9051 ↔ spark-9797')+'</span><span class="net-200g-lat" style="color:'+lkc+'">'+lkt+'</span></div>';
+var htm='<div class="card net-card"><div class="net-top"><div class="net-200g"><span class="net-200g-icon">\u26a1</span><span class="net-200g-label">200G</span><span class="net-200g-nodes">'+esc(l200.link200_nodes||'spark-9051 \u2194 spark-9797')+'</span><span class="net-200g-lat" style="color:'+lkc+'">'+lkt+'</span></div>';
 var tbs=lk.tb||[];tbs.forEach(function(tb){htm+='<div class="net-tb-link">\U0001f5e1 '+esc(tb.from)+' \u2194 '+esc(tb.to)+' <span class="net-tb-speed">'+esc(tb.speed)+'</span></div>';});
-htm+='</div>';var nn=typeof NODE_NAMES!='undefined'?NODE_NAMES:{};
-// Build 5x5 latency matrix (keyed by short label)
-function sl(l){var i=l.indexOf(' ');return i>0?l.substring(0,i):l}
-var mKeys=Object.keys(ns);var mLabels={};for(var mi=0;mi<mKeys.length;mi++){var full=nn[mKeys[mi]]||mKeys[mi].split('.')[0];mLabels[mKeys[mi]]=sl(full)}
-var matrix={};for(var mi=0;mi<mKeys.length;mi++){var sk=mKeys[mi];var sn=ns[sk];var nps=(sn.ping||{}).node_pings||[];var rl=mLabels[sk];matrix[rl]={};for(var mj=0;mj<nps.length;mj++){matrix[rl][nps[mj].node]=nps[mj].ms}}
-htm+='<div class="net-toggle" onclick="toggleMatrix(this)"><span class="net-toggle-icon">▶</span>延迟矩阵 <span class="net-toggle-badge">5×5</span></div><div class="net-matrix-wrap open"><div class="node-lat-grid">';
-// Column headers: empty top-left + node names
-htm+='<div class="nl-cell col-header"></div>';for(var ci=0;ci<mKeys.length;ci++){htm+='<div class="nl-cell col-header">'+esc(mLabels[mKeys[ci]])+'</div>'}
-// Data rows (keyed by short label, matches ping data)
-for(var ri=0;ri<mKeys.length;ri++){var rl=mLabels[mKeys[ri]];htm+='<div class="nl-cell row-header">'+esc(rl)+'</div>';
-  for(var ci=0;ci<mKeys.length;ci++){var cl=mLabels[mKeys[ci]];
-    if(rl===cl){htm+='<div class="nl-cell"><span class="nl-self">·</span></div>'}
-    else{var mv=matrix[rl]?matrix[rl][cl]:undefined;
-      if(typeof mv==='number'){var mc=mv<0.5?'c-green':mv<3?'c-yellow':'c-red';var bg=mv<0.5?'rgba(34,197,94,'+(0.15+0.35*Math.max(0,1-mv/0.5))+')':mv<3?'rgba(234,179,8,0.15)':'rgba(239,68,68,0.15)';htm+='<div class="nl-cell" style="background:'+bg+'"><span class="nl-ms '+mc+'">'+mv.toFixed(2)+'</span></div>'}
-      else{htm+='<div class="nl-cell"><span class="nl-self">?</span></div>'}}}
+htm+='</div>';
+// Toggle button + legend inline
+htm+='<div class="tog ex" onclick="toggleMatrix(this)"><span class="tog-i">\u25b6</span><span class="tog-t">\u516c\u7f51\u5ef6\u8fdf</span><span class="tog-b">5\u00d75</span><span class="leg"><span class="leg-i"><span class="leg-d" style="background:rgba(34,197,94,.5)"></span>&lt;50ms</span><span class="leg-i"><span class="leg-d" style="background:rgba(234,179,8,.5)"></span>50-200ms</span><span class="leg-i"><span class="leg-d" style="background:rgba(239,68,68,.5)"></span>&gt;200ms</span></span></div>';
+htm+='<div class="net-matrix-wrap open"><div class="pg-grid">';
+// Column headers
+var nn=typeof NODE_NAMES!='undefined'?NODE_NAMES:{};
+htm+='<div></div>';
+for(var si=0;si<PUBLIC_SERVICES.length;si++){
+  var sk=PUBLIC_SERVICES[si];
+  htm+='<div class="ph"><img src="'+LOGOS[sk[0]]+'" alt="'+sk[1]+'" class="pgi"><span class="sn">'+sk[1]+'</span></div>';
 }
-htm+='<div class="nl-legend"><span class="nl-legend-item"><span class="nl-dot" style="background:rgba(34,197,94,0.4)"></span>&lt;0.5ms</span><span class="nl-legend-item"><span class="nl-dot" style="background:rgba(234,179,8,0.4)"></span>0.5-3ms</span><span class="nl-legend-item"><span class="nl-dot" style="background:rgba(239,68,68,0.4)"></span>&gt;3ms</span></div>'
+// Location column
+htm+='<div class="ph"><svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 1C5.24 1 3 3.24 3 6c0 3.75 5 9 5 9s5-5.25 5-9c0-2.76-2.24-5-5-5z" fill="#ef4444"/><circle cx="8" cy="6" r="2" fill="#fff"/></svg><span class="sn">\u4f4d\u7f6e</span></div>';
+// Data rows
+var mKeys=Object.keys(ns);
+for(var ri=0;ri<mKeys.length;ri++){
+  var nodeKey=mKeys[ri];var nd=ns[nodeKey];
+  var fn=nn[nodeKey]||(nodeKey.indexOf('.')>=0?nodeKey.split('.')[0]:nodeKey);
+  var sp=fn.indexOf(' ');if(sp>0)fn=fn.substring(0,sp);
+  htm+='<div class="pr">'+esc(fn)+'</div>';
+  var pings=(nd.ping||{});
+  for(var si=0;si<PUBLIC_SERVICES.length;si++){
+    var sk=PUBLIC_SERVICES[si];var val=pings[sk[2]];var g=sk[3];var y=sk[4];
+    if(typeof val==='number'){
+      var c=val<g?'rgba(34,197,94,0.15)':val<y?'rgba(234,179,8,0.15)':'rgba(239,68,68,0.15)';
+      var tc=val<g?'rgba(34,197,94,.9)':val<y?'rgba(234,179,8,.9)':'rgba(239,68,68,.9)';
+      htm+='<div style="background:'+c+';color:'+tc+';font-weight:bold">'+Math.round(val)+'ms</div>';
+    }else{
+      htm+='<div class="na">N/A</div>';
+    }
+  }
+  // Location
+  var loc=pings['public_loc']||'';
+  htm+='<div style="color:#667;font-size:6px">'+esc(loc.slice(0,12))+'</div>';
+}
 htm+='</div></div></div>';return htm;}
-// Toggle latency matrix
-function toggleMatrix(el){el.classList.toggle('open');var w=el.nextElementSibling;if(w)w.classList.toggle('open')}
+// Toggle public ping matrix
+function toggleMatrix(el){el.classList.toggle('ex');var w=el.nextElementSibling;if(w)w.classList.toggle('open')}
 function switchTheme(t){localStorage.setItem('dltrace-theme',t);document.body.className='theme-'+t;document.querySelectorAll('.theme-btn,.stheme-btn').forEach(function(b){b.classList.toggle('active',b.dataset.theme===t)})}
 function applyTheme(t){switchTheme(t)}
 function navTo(el,id){document.getElementById(id).scrollIntoView({behavior:'smooth'});document.querySelectorAll('.nav-item.active').forEach(function(e){e.classList.remove('active')});el.classList.add('active')}
