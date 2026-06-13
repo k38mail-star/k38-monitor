@@ -212,9 +212,6 @@ DEAD_TIMEOUT      = 30   # 新文件30秒无增长视为死
 # 监控目录(自动检测常见下载路径)
 DEFAULT_WATCH_DIRS = [
     "/tmp",
-    os.path.expanduser("~"),
-    os.path.expanduser("~/Downloads"),
-    os.path.expanduser("~/downloads"),
     os.path.expanduser("~/k38_output"),
 ]
 
@@ -1329,39 +1326,54 @@ class DownloadTracker:
             hardcoded={
                 "三万八":    "http://192.168.3.29:8899/api/v1/metrics",
                 "小四":      "http://192.168.3.46:8899/api/v1/metrics",
-                "大傻":      "http://192.168.3.55:8899/api/v1/metrics",
-                "二傻":      "http://192.168.3.45:8899/api/v1/metrics",
+                "大傻":      "jager-dgx@10.0.0.126",
+                "二傻":      "jager-dgx-2@192.168.3.45",
             }
         )
         # 远程节点: 剥离nodes桶(避免循环引用), 不包含localhost(报告本身即是)
         nodes = {}
 
-        def _pull_node(name, url):
+        def _pull_node(name, target):
             try:
-                import urllib.request
-                r = urllib.request.urlopen(url, timeout=5)
-                data = json.loads(r.read().decode())
-                if isinstance(data, dict):
-                    data.pop("nodes", None)
-                    data.pop("nodes_count", None)
-                return name, data
+                if target.startswith('http'):
+                    import urllib.request
+                    r = urllib.request.urlopen(target, timeout=5)
+                    data = json.loads(r.read().decode())
+                    if isinstance(data, dict):
+                        data.pop("nodes", None)
+                        data.pop("nodes_count", None)
+                    return name, data
+                # SSH模式: 采集DGX GPU/Docker/系统信息
+                import subprocess
+                script = os.path.expanduser('~/.openclaw/workspace/dltrace/scripts/k38_remote_collect.py')
+                if not os.path.exists(script):
+                    return name, None
+                subprocess.run(['scp', '-i', os.path.expanduser('~/.ssh/k38_dgx1'), '-o', 'ConnectTimeout=3',
+                    script, target + ':/tmp/k38_collect.py'], capture_output=True, timeout=5)
+                r = subprocess.run(['ssh', '-i', os.path.expanduser('~/.ssh/k38_dgx1'), '-o', 'ConnectTimeout=3',
+                    target, 'python3', '/tmp/k38_collect.py'], capture_output=True, text=True, timeout=8)
+                if r.returncode == 0 and r.stdout.strip():
+                    data = json.loads(r.stdout.strip())
+                    data['_source'] = 'ssh'
+                    return name, {'system': data}
+                return name, None
             except Exception:
                 return name, None
 
         with ThreadPoolExecutor(max_workers=4) as pool:
-            futs = {}
-            for n, u in KNOWN_NODES.items():
-                futs[pool.submit(_pull_node, n, u)] = n
-            for future in as_completed(futs, timeout=10):
-                name = futs[future]
-                try:
-                    result = future.result()
-                    if isinstance(result, tuple) and len(result) == 2:
-                        nd_name, nd_data = result
-                        if nd_data:
-                            nodes[nd_name] = nd_data
-                except Exception:
-                    pass
+            futs = {pool.submit(_pull_node, n, u): n for n, u in KNOWN_NODES.items()}
+            import concurrent.futures as _cf
+            try:
+                for future in _cf.as_completed(futs, timeout=10):
+                    name = futs.get(future)
+                    if name is None: continue
+                    try:
+                        result = future.result(timeout=2)
+                        if isinstance(result, tuple) and len(result) == 2:
+                            nd_name, nd_data = result
+                            if nd_data: nodes[nd_name] = nd_data
+                    except Exception: pass
+            except _cf.TimeoutError: pass
 
         # 合并远程节点数据到同一report
         # 注意: 不包含localhost(报告本身即是, 再加会循环引用)
