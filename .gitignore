@@ -8,3 +8,6 @@ dist/
 .DS_Store
 *.bak
 *.pre_*
+dltrace.py.v042_backup
+*.log
+node_modules/

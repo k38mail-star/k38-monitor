@@ -81,6 +81,55 @@ def _load_node_config(hardcoded: dict) -> dict:
 
 import socketserver
 
+# Redis & PostgreSQL 连接
+_REDIS = None
+_PG = None
+def _get_redis():
+    global _REDIS
+    if _REDIS is None:
+        try:
+            import redis
+            _REDIS = redis.Redis(host='47.86.98.87', port=6379, db=0, socket_connect_timeout=2)
+            _REDIS.ping()
+        except Exception:
+            _REDIS = None
+    return _REDIS
+
+def _get_pg():
+    global _PG
+    if _PG is None:
+        try:
+            import psycopg2
+            _PG = psycopg2.connect(host='100.93.251.118', port=5432, dbname='dltrace',
+                                   user='medusa', password=os.environ.get('DLTRACE_PGPASS', ''), connect_timeout=2)
+        except Exception:
+            _PG = None
+    return _PG
+
+def _key_latest():
+    return 'dlt:latest'
+
+def _init_pg():
+    pg = _get_pg()
+    if pg is None:
+        return
+    try:
+        cur = pg.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS dlt_snapshots (
+                ts TIMESTAMPTZ DEFAULT NOW(),
+                data JSONB
+            )
+        ''')
+        cur.execute('''
+            CREATE INDEX IF NOT EXISTS idx_dlt_snapshots_ts
+            ON dlt_snapshots(ts DESC)
+        ''')
+        pg.commit()
+        cur.close()
+    except Exception:
+        pass
+
 # 🔒 禁用__pycache__字节码缓存 (根因: pyc缓存导致代码更新后仍跑旧版本)
 sys.dont_write_bytecode = True
 
@@ -124,7 +173,7 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 # 配置常量
 # ════════════════════════════════════════════
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 # Web Authentication
 DLTRACE_TOKEN = os.environ.get("DLTRACE_TOKEN", "")
@@ -1473,6 +1522,10 @@ def cmd_web(args: argparse.Namespace):
     # 绑定到 localhost 限制外部访问(通过SSH隧道或本地访问)
     bind_host = os.environ.get("DLTRACE_BIND", WEB_BIND)
     server = ThreadedHTTPServer((bind_host, port), _make_handler(progress_file, ssh_target, extra_nodes))
+    
+    # 初始化PostgreSQL表
+    _init_pg()
+    
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1589,6 +1642,19 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                 self.wfile.write(b"OK")
                 return
             data = self._read_data()
+            # Redis缓存 + PostgreSQL历史
+            try:
+                r = _get_redis()
+                if r:
+                    r.setex('dlt:latest', 300, json.dumps(data, default=str))
+                pg = _get_pg()
+                if pg:
+                    cur = pg.cursor()
+                    cur.execute('INSERT INTO dlt_snapshots (data) VALUES (%s)', (json.dumps(data, default=str),))
+                    pg.commit()
+                    cur.close()
+            except Exception:
+                pass
             if path == "/api/v1/metrics":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1674,106 +1740,90 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                             f'<text x="{cx}" y="{cx+9}" text-anchor="middle" fill="#445" '
                             f'font-size="6px">{esc(label)}</text></svg></div>')
 
-                # System monitoring
-                sys_html = ""
-                for h, n in ns.items():
-                    friendly = NODE_NAMES.get(h, h.split(".")[0] if "." in h else h)
+
+                def _node_card_html(host, n):
+                    friendly = NODE_NAMES.get(host, host.split(".")[0] if "." in host else host)
                     s = n.get("system", {})
                     dots = (n.get("tracked_total") or 0) > 0 or (n.get("ts") or 0) > 1700000000
-                    dc = "online" if dots else "offline"; tc = "#0ff" if dots else "#222"
-                    card = f'<div class="card sys-card" style="border-top:2px solid {tc}"><div class="card-header"><span class="card-title {dc}"><span class="status-dot {dc}"></span>{esc(friendly)}</span><span class="card-ts">{n.get("ts_str","--:--:--")}</span></div><div style="display:flex;flex-wrap:wrap;justify-content:center;gap:2px">'
-                    if s.get("cpu_pct") is not None: card += _sys_gauge("CPU", s["cpu_pct"], "%")
-                    elif s.get("load_1m") is not None: card += _sys_gauge("LD", s["load_1m"], "")
-                    if s.get("mem_pct") is not None: card += _sys_gauge("MEM", s["mem_pct"], "%")
-                    if s.get("gpu_pct") is not None: card += _sys_gauge("GPU", s["gpu_pct"], "%")
-                    if s.get("disk_pct") is not None: card += _sys_gauge("DSK", float(s["disk_pct"]), "%")
-                    if s.get("gpu_temp") is not None: card += _sys_gauge("TMG", s["gpu_temp"], "\u00b0")
-                    if s.get("cpu_temp") is not None: card += _sys_gauge("TMC", s["cpu_temp"], "\u00b0")
-                    # 趋势sparkline
-                    hist = n.get("history") or {}
-                    if hist.get("cpu"): card += _sparkline(hist["cpu"], "#0ff", 100, 24)
-                    gpu_info = (s.get("gpu_info") or "")
-                    if gpu_info: card += f'<div style="width:100%;text-align:center;margin-top:2px"><span class="gpu-tag" title="{esc(gpu_info)}">{esc(gpu_info[:30])}</span></div>'
-                    if s.get("load"): card += f'<div style="width:100%;text-align:center"><span class="sys-load">LD: {esc(s["load"])}</span></div>'
-                    if s.get("gpu_clk_graphics") is not None and s.get("gpu_clk_memory") is not None: card += f'<span class="gpu-clk">⚡ {s["gpu_clk_graphics"]}MHz 💾 {s["gpu_clk_memory"]}MHz</span>'
-                    if s.get("fan_rpm_avg") is not None: card += f'<span class="fan-speed">❄ {s["fan_rpm_avg"]} RPM</span>'
-                    card += "</div></div>"; sys_html += card
+                    dc = "online" if dots else "offline"
+                    dot_cls = "on" if dots else "off"
+                    emoji_map = {"localhost": "W", "十六万": "W", "192.168.3.29": "X", "三万八": "X", "192.168.3.46": "C", "小四": "C", "192.168.3.55": "D", "大傻": "D", "192.168.3.45": "E", "二傻": "E"}
+                    emoji = emoji_map.get(host, emoji_map.get(host.split(" ")[0] if " " in host else host, "?"))
+                    card = "<div class='node-card' onclick=\"var d=this.querySelector('.detail');if(d)d.classList.toggle('show')\" data-host='" + esc(host) + "'>"
+ 
+                    card += '<div class="hdr"><span class="nm ' + dc + '">' + emoji + ' ' + esc(friendly) + '</span><span class="dot ' + dot_cls + '"></span></div>'
+                    if s.get("cpu_pct") is not None:
+                        cv = float(s["cpu_pct"]);
+                        card += '<div class="rl"><span>CPU</span><span>' + str(int(cv)) + '%</span></div><div class="gbar"><div class="gfill ' + ('ok' if cv<70 else 'warn') + '" style="width:' + str(min(cv,100)) + '%"></div></div>'
+                    if s.get("mem_pct") is not None:
+                        mv = float(s["mem_pct"]);
+                        card += '<div class="rl"><span>RAM</span><span>' + str(int(mv)) + '%</span></div><div class="gbar"><div class="gfill ' + ('ok' if mv<70 else 'warn') + '" style="width:' + str(min(mv,100)) + '%"></div></div>'
+                    if s.get("gpu_pct") is not None:
+                        gv = float(s["gpu_pct"]);
+                        card += '<div class="rl"><span>GPU</span><span>' + str(int(gv)) + '%</span></div><div class="gbar"><div class="gfill ' + ('ok' if gv<70 else 'warn') + '" style="width:' + str(min(gv,100)) + '%"></div></div>'
+                    if s.get("gpu_temp") is not None:
+                        tv = float(s["gpu_temp"]);
+                        card += '<div class="rl"><span>TEMP</span><span>' + str(int(tv)) + 'C</span></div><div class="gbar"><div class="gfill ' + ('ok' if tv<55 else 'warn') + '" style="width:' + str(min(tv,100)) + '%"></div></div>'
+                    if s.get("disk_pct") is not None:
+                        dv = float(s["disk_pct"]);
+                        card += '<div class="rl"><span>DISK</span><span>' + str(int(dv)) + '%</span></div><div class="gbar"><div class="gfill ' + ('ok' if dv<70 else 'warn') + '" style="width:' + str(min(dv,100)) + '%"></div></div>'
+                    card += '<div class="detail">'
+                    if s.get("gpu_info"): card += '<div class="row"><span class="k">GPU</span><span class="v">' + esc(s["gpu_info"][:25]) + '</span></div>'
+                    if s.get("gpu_clk_graphics") is not None: card += '<div class="row"><span class="k">Clock</span><span class="v">' + str(s["gpu_clk_graphics"]) + '/' + str(s.get("gpu_clk_memory","?")) + 'MHz</span></div>'
+                    if s.get("fan_rpm_avg") is not None: card += '<div class="row"><span class="k">Fan</span><span class="v">' + str(s["fan_rpm_avg"]) + ' RPM</span></div>'
+                    if s.get("load"): card += '<div class="row"><span class="k">Load</span><span class="v">' + esc(s["load"]) + '</span></div>'
+                    if s.get("uptime"): card += '<div class="row"><span class="k">Uptime</span><span class="v">' + esc(s["uptime"]) + '</span></div>'
+                    card += '<div class="row"><span class="k">DLT</span><span class="v">' + __version__ + '</span></div>'
+                    card += '</div></div>'
+                    return card
 
-                # Network section
-                net_html = '<div class="card net-card"><div class="net-top">'
+                sys_html = ""
+                for h, n in ns.items():
+                    sys_html += _node_card_html(h, n)                # Network section
+                # 方案C: 隐藏旧CMD区域
+                net_html = ''
+                dl_html = ''
+                job_html = ''
+                dock_html = ''
+                disk_html = ''
+                if False: net_html = '<div class="card net-card">'
                 l200 = (data.get("network") or {}).get("link200", {})
                 lkc = "#0f0" if l200.get("up") else "#f44"
                 lkt = f"{l200['latency']:.2f}ms" if l200.get("latency") else ("DOWN" if not l200.get("up") else "...")
                 nodes_200g = l200.get("link200_nodes", "spark-9051 ↔ spark-9797")
-                net_html += f'<div class="net-200g"><span class="net-200g-icon">⚡</span><span class="net-200g-label">200G</span><span class="net-200g-nodes">{nodes_200g}</span><span class="net-200g-lat" style="color:{lkc}">{lkt}</span></div>'
-                tbs = (data.get("network") or {}).get("tb", [])
-                for tb in tbs: net_html += f'<div class="net-tb-link">🗡 {esc(tb.get("from",""))} ↔ {esc(tb.get("to",""))} <span class="net-tb-speed">{esc(tb.get("speed",""))}</span></div>'
+                net_html += f'<div class="net-row"><div class="net-200g"><span class="net-200g-icon">⚡</span><span class="net-200g-label">200G</span><span class="net-200g-nodes">{nodes_200g}</span><span class="net-200g-lat" style="color:{lkc}">{lkt}</span></div></div>'
+                # Public service badges
+                min_pings = {}
+                for h, node in ns.items():
+                    p = node.get("ping") or {}
+                    for k, v in p.items():
+                        if k != "public_loc" and isinstance(v, (int, float)):
+                            if k not in min_pings or v < min_pings[k]:
+                                min_pings[k] = v
+                svc_cfg = [
+                    ("baidu_ms", "百度", 50, 200),
+                    ("ytb_ms", "YouTube", 200, 500),
+                    ("github_ms", "GitHub", 50, 200),
+                    ("google_ms", "Google", 100, 300),
+                    ("yahoo_hk_ms", "Yahoo", 50, 200),
+                ]
+                badges = []
+                for key, name, green_thr, yellow_thr in svc_cfg:
+                    val = min_pings.get(key)
+                    if val is not None:
+                        if val < green_thr:
+                            cls = "net-fast"
+                        elif val < yellow_thr:
+                            cls = "net-mid"
+                        else:
+                            cls = "net-slow"
+                        badges.append(f'<span class="net-badge {cls}">{esc(name)} <b>{int(val)}ms</b></span>')
+                    else:
+                        badges.append(f'<span class="net-badge net-na">{esc(name)} N/A</span>')
+                if badges:
+                    net_html += '<div class="net-pub">' + "".join(badges) + '</div>'
                 net_html += '</div>'
-                # 5×5 延迟矩阵
-                m_keys = list(ns.keys())
-                if m_keys:
-                    # ====== NEW: Public service ping matrix ======
-                    net_html += '<div class="tog ex" onclick="toggleMatrix(this)"><span class="tog-i">\u25b6</span><span class="tog-t">\u516c\u7f51\u5ef6\u8fdf</span><span class="tog-b">5\u00d75</span><span class="leg"><span class="leg-i"><span class="leg-d" style="background:rgba(34,197,94,.5)"></span>&lt;50ms</span><span class="leg-i"><span class="leg-d" style="background:rgba(234,179,8,.5)"></span>50-200ms</span><span class="leg-i"><span class="leg-d" style="background:rgba(239,68,68,.5)"></span>&gt;200ms</span></span></div>'
-                    net_html += '<div class="net-matrix-wrap open"><div class="pg-grid">'
-                    # Column headers: empty + services + location
-                    net_html += '<div></div>'
-                    net_html += '<div class="ph"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj42NDwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj42NDwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgohBDnEAAACk0lEQVQ4EaVTS0hUURj+7mPunWbU0Sl7OG0SM1PMRKRty1oURRRB2EOidhmkUQNiL4ImahEt2rVpLxSBWFpjgaljhmIa5jjjC3VGRkadO/cx93TOHb2ktYl+OPd1/v873/f9/wUhhKcrQNe/BqvhQS9/FHd9VkhnMGUBKmmTtL5ZISM/1L8dEGAAG6K7RyGlVVFSciBCBodU8vJVkuwsDpPDR6bJQszYkMteeGyK/gEVSppA14DhUQ3fRzQ4nTwmpw1MRPRN2YC4/mVm1kA4YqCiXIJrCwfTBMr3SVAUE6pKUFbqgMfD40OXgtoaGTnutbMZjeRyhhw/PUt8eycsyqGvadLTp7AtK9o7VsnPsEau34yRHXsmiL8lTkwzu2cxmKL0Rsd0SA4OwU8KLp7LBWP06GkC+R4B9edzYRjAl7403C6O3lVoGoEsc1kJRbtElBQ7MPBNRVWljPhiBmcvzGM8rEOgRwwMqnj+pNDKiUQN1FTLcEicpZ5jRNjT9IyBsXEd5WUSGprirDsQRQ7dvWmAZlypz8OlujwMDWs4VCsjNyfrgW3ibp9oFVxrjCMS1XG7MR+TUxlEJg0kkxm8bUtB0wn8TV6Iwrr1gN3GWDyDusvzqKyQ8OJZIaoPOi0W95u98BYIeHjXi/b3Kdy4Fad+WKQtFBug46NiaT51wg3/nUW0vl6B7OQgS0DGpHIEDi4Xj7Z3KZpHHV0LG8DhANJ0gDqDCu41b8Wxo24sUjOTyyYCD7aBSdSpBI56J/wmwTYxkTBxtWEBoX4V+6mR3gIeS0smdEqXSVimQGO0K2dO5qDF77VBGECAsmlijFZWTfSGsj32FYnw0fYyvVE6J3NzBrYXCnQKneBt3njMjPqv3/kXJUADijW0BeUAAAAASUVORK5CYII=" alt="百度" class="pgi"><span class="sn">百度</span></div>'
-                    net_html += '<div class="ph"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAAAw0lEQVQ4EaVTiw2FIAwsL28ANpARGIEV3MAR3UBHcATcgA14LfLRgI0+SAjl6J09qMJ7Dz3j00Mm7jcLCCEx1nFvMn4N1rjdwHsXYrKAJiacZObNnIJ9JOmXxPNHNN2BimX9swSB5LsWsBbAmBoviOJfYRgAlgVgnrFOVWiniBdIiVKmqFp5gX0HGMfDBtlpDOqDrYEfkMbrce72GA8sVWBvM3gy0aih+hpJ5J/p2spYO8hGZWvEcisXgUb2E4h/hQcKPzl8hRVGXE8aAAAAAElFTkSuQmCC" alt="YouTube" class="pgi"><span class="sn">YouTube</span></div>'
-                    net_html += '<div class="ph"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABRUlEQVR4nIVSW3LCMAxcOS5cAJLS3P9W/JdgX4AMtjorbNC0TKMZ4sTsrh4rUVWFi5wz7qoQVaiI3fX3KILD4eDhEC+w5AytFdKIv4PQGgK+nEjoL5eUiHhLfAoAGFQfWC9wyRlvc1KwifIp7iTHBFJKkFqtPMbnOOK+rigA7jE+fusKlGL/mQhnVCvIjQRazxxUSzzP8z99NJSIJQniLqi6FaygD5nc8LQKQBmGTQHvOrnBT/5jwwVGjdGq7e2E/mEeb9KBwFn1VlmBtqy9r+/rFefz+Q+Rd8uyWNaONTdSSlqa3+axCGoTPY2jnUYkyRO5VCEg2G6zpA6gGzwLTXLh1rvbTq5t4jRNqBRxmxfCc8sxNHe8A+QYrl+cpsla6Ktqgi6j+d+8n47H11B9lex5HyNKrSiuhdvtBs5pv9thbHPp8QOVn7yjFD03pQAAAABJRU5ErkJggg==" alt="GitHub" class="pgi"><span class="sn">GitHub</span></div>'
-                    net_html += '<div class="ph"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgqWsr5jAAACfElEQVQ4EXVTz0tUURT+3o9RZ0YyiSIrpNoESZSYoRmEES5D002Bk1AKZZuC8h+Qglpki2ihLiKERIlq1cIi0yJIEfwBif1QtEVClI7z8713b995k+JYHvju3HPud8797pnzgA2mtd7qum4TMex5XkKglBpi/IKcbaBnu0yqJ2mC2MzGyTm7PstYdXjTdcM07zBgOWMfkXwzAO/bFx5rWHv3I6+6BoHScqE7VNRmWdY9cfwCvK6O+z6kktbKww4kXvRDxVZgBALCgXYcGLl5CF9qRTjSDPI9FmmwbfuZTaeAnHa5KPqAyf2PYYTCCJ5pQE55hV8g/WEY7tfPyCk75vuGYVCA1c7c11KtidDewqD+ee6g/nGyXFOBhLItupTtZ7wIKGVY9t70ZZ3qhY51tawRFXeJtNZxgUOklA/Hy1CY+9ampjLRpZcnYRYCwROHfJmyxFMaLd1JRJMaJrslSLvA+eMBHyxz1NYk+p3kr0XHUJL6rwknxoLLCWApLlkZk6KjsrXyS7DgmniyMMt+ZiyUa6C7OYjeqyH0XAnhQJEJT2kUFZo+gc0cMbl0ivdrRyNuxqtxa3YOfTMvMwSuefwngznA0LSHqXlgW76Bw8VrBToNvmMLee+pvOT2SBd6Pj1F2A7idHEVKncegWmaGF2cwKsJIPW9HpGK7WitkfnQk3xwlf98FqllpD+p0tb9sUe+gqgTQ8CUHsvouQgFbNTuuoi2yjpR5XJyZZCer/YPDFzje+6CQzKyOIWB+XeY+T3HOQH2FezGqT2VqCoqZTntKqVvcJA6/OrrF/lQqGac+L8pJWeidnMjQT7nCIdkkIj9xSDjjYSMfZb9ARmRtLGfbP3kAAAAAElFTkSuQmCC" alt="Google" class="pgi"><span class="sn">Google</span></div>'
-                    net_html += '<div class="ph"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj40ODwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj40ODwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgrZdbzTAAABsUlEQVQ4EYWTOy9EQRTHf3d22SBRsEuEkKyCxGNVEiIaGolQ+AI+g1Yi0fgYOoXGYyMa5RZCIpZ4RSEeQWIRhffaO87suNm99orTzMx//v9zzpwzx5nu1P0hxTIOdVpTYu4XuK6FHQWhMDgOCDdDiPGwUiRFXBsozkEsDtX14kCcf7zAzXFeLBJiuCTDsgkUG4fhcpiYg6Yum8HmAlymBY/k/eFooiog6zw79wnxXmjstOIvOaeTkr48wzOjLTp68M8qqfWM2/ca5GwLrg+kBmV+XqADU7i6VmgbLJB3VyEn+G8LdJDLQvcIRKos/f4cTlO2Jv860NKyyhpIjBao++vw+uR/v3dbkoGJ3jEsrWmxlOw77K3Z/nui4lW+hd9MlT+eITVvU76/gMcrqXYJ0+p8sOl9eaUl3xzB4QZ8vglW4Q9SfPI5cCX9oSkYmLSU7UVYnS2ml+4LNZDoSnrc2lcgNff8/Dq5+8uU/BdrsjH9310B8+tM8XaW7GqGJ8gM7MwkdEYGJeoFMW1saLcDc3siWYWCpIKbgJoHpRVjQsl4UUwXrg/t1P0lznM1dzLmY98XE4KRGYksiAAAAABJRU5ErkJggg==" alt="Yahoo" class="pgi"><span class="sn">Yahoo</span></div>'
-                    net_html += '<div class="ph"><svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 1C5.24 1 3 3.24 3 6c0 3.75 5 9 5 9s5-5.25 5-9c0-2.76-2.24-5-5-5z" fill="#ef4444"/><circle cx="8" cy="6" r="2" fill="#fff"/></svg><span class="sn">位置</span></div>'
-                    # Data rows: one per node
-                    for h in m_keys:
-                        n = ns[h]
-                        fn = NODE_NAMES.get(h, h.split(".")[0] if "." in h else h)
-                        sp = fn.find(" ")
-                        if sp > 0: fn = fn[:sp]
-                        net_html += f'<div class="pr">{esc(fn)}</div>'
-                        # Baidu
-                        val = (n.get("ping") or {}).get("baidu_ms")
-                        if val is not None:
-                            c = "rgba(34,197,94,0.15)" if val < 50 else ("rgba(234,179,8,0.15)" if val < 200 else "rgba(239,68,68,0.15)")
-                            tc = "rgba(34,197,94,.9)" if val < 50 else ("rgba(234,179,8,.9)" if val < 200 else "rgba(239,68,68,.9)")
-                            net_html += f'<div style="background:{c};color:{tc};font-weight:bold">{int(val)}ms</div>'
-                        else:
-                            net_html += '<div class="na">N/A</div>'
-                        # YouTube
-                        val = (n.get("ping") or {}).get("ytb_ms")
-                        if val is not None:
-                            c = "rgba(34,197,94,0.15)" if val < 200 else ("rgba(234,179,8,0.15)" if val < 500 else "rgba(239,68,68,0.15)")
-                            tc = "rgba(34,197,94,.9)" if val < 200 else ("rgba(234,179,8,.9)" if val < 500 else "rgba(239,68,68,.9)")
-                            net_html += f'<div style="background:{c};color:{tc};font-weight:bold">{int(val)}ms</div>'
-                        else:
-                            net_html += '<div class="na">N/A</div>'
-                        # GitHub
-                        val = (n.get("ping") or {}).get("github_ms")
-                        if val is not None:
-                            c = "rgba(34,197,94,0.15)" if val < 50 else ("rgba(234,179,8,0.15)" if val < 200 else "rgba(239,68,68,0.15)")
-                            tc = "rgba(34,197,94,.9)" if val < 50 else ("rgba(234,179,8,.9)" if val < 200 else "rgba(239,68,68,.9)")
-                            net_html += f'<div style="background:{c};color:{tc};font-weight:bold">{int(val)}ms</div>'
-                        else:
-                            net_html += '<div class="na">N/A</div>'
-                        # Google
-                        val = (n.get("ping") or {}).get("google_ms")
-                        if val is not None:
-                            c = "rgba(34,197,94,0.15)" if val < 100 else ("rgba(234,179,8,0.15)" if val < 300 else "rgba(239,68,68,0.15)")
-                            tc = "rgba(34,197,94,.9)" if val < 100 else ("rgba(234,179,8,.9)" if val < 300 else "rgba(239,68,68,.9)")
-                            net_html += f'<div style="background:{c};color:{tc};font-weight:bold">{int(val)}ms</div>'
-                        else:
-                            net_html += '<div class="na">N/A</div>'
-                        # Yahoo
-                        val = (n.get("ping") or {}).get("yahoo_hk_ms")
-                        if val is not None:
-                            c = "rgba(34,197,94,0.15)" if val < 50 else ("rgba(234,179,8,0.15)" if val < 200 else "rgba(239,68,68,0.15)")
-                            tc = "rgba(34,197,94,.9)" if val < 50 else ("rgba(234,179,8,.9)" if val < 200 else "rgba(239,68,68,.9)")
-                            net_html += f'<div style="background:{c};color:{tc};font-weight:bold">{int(val)}ms</div>'
-                        else:
-                            net_html += '<div class="na">N/A</div>'
-                        # Location
-                        loc = (n.get("ping") or {}).get("public_loc", "")
-                        net_html += f'<div style="color:#667;font-size:6px">{esc(loc[:12])}</div>'
-                    net_html += '</div></div>'
+
                 net_html += '</div>'
                 dl_html = ""
                 total_files = 0
@@ -1815,14 +1865,34 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                     dl_html += card
 
                 node_count = len(ns)
+                online_nodes = sum(1 for h2,n2 in ns.items() if n2.get("system",{}).get("cpu_pct") is not None)
+                max_temp = 0
+                max_uptime = 0
+                for h2, n2 in ns.items():
+                    s2 = n2.get("system",{})
+                    if s2.get("gpu_temp"):
+                        max_temp = max(max_temp, float(s2["gpu_temp"]))
+                    if s2.get("uptime"):
+                        t = s2["uptime"]
+                        for unit in ("天","days","d"):
+                            if unit in t:
+                                try:
+                                    d = float(t.split(unit)[0].strip())
+                                    max_uptime = max(max_uptime, d)
+                                except: pass
+                m_online = f'{online_nodes}/{node_count}'
+                m_temp = f'{int(max_temp)}C' if max_temp else '--C'
+                m_uptime = f'{int(max_uptime)}h' if max_uptime else '--h'
                 status_bar = f'<span class="status-dot {"online" if node_count>0 else "offline"}"></span> {node_count} nodes · {total_files} files'
 
                 html = HTML.replace("{{SYS_HTML}}", sys_html)
-                html = html.replace("{{NET_HTML}}", net_html)
-                html = html.replace("{{DL_HTML}}", dl_html)
-                # Job HTML (server-side initial render)
-                job_html = '<div class="job-empty"><div class="icon">&#x1f4ad;</div><p>加载中...</p></div>'
-                html = html.replace("{{JOB_HTML}}", job_html)
+                html = html.replace("{{NET_HTML}}", "")
+                html = html.replace("{{DL_HTML}}", "")
+                html = html.replace("{{JOB_HTML}}", "")
+                html = html.replace("{{ONLINE}}", m_online)
+                html = html.replace("{{TEMP}}", m_temp)
+                html = html.replace("{{UPTIME}}", m_uptime)
+                html = html.replace("{{LATENCY}}", "--ms")
                 html = html.replace("{{STATUS_BAR}}", status_bar)
                 html = html.replace("{{VERSION}}", __version__)
                 html = html.replace("{{TS}}", datetime.now().strftime("%H:%M:%S"))
@@ -1842,471 +1912,156 @@ def _fmt_size(mb):
     return f"{mb:.0f}MB"
 
 
+def _fmt_size_friendly(val):
+    """Convert bytes/GB/MB to human string. Accepts string or number."""
+    try: v = float(val)
+    except: return str(val)[:12]
+    if v >= 1024*1024*1024: return f"{v/1024/1024/1024:.1f}GB"
+    if v >= 1024*1024: return f"{v/1024/1024:.0f}MB"
+    if v >= 1024: return f"{v/1024:.0f}KB"
+    return f"{v:.0f}B"
+
+
 def _get_dashboard_html() -> str:
-    """返回HTML模板(工业风)"""
+    """返回HTML模板(方案C仪表盘混搭)"""
     return r"""<!DOCTYPE html><html lang="zh"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>K38 MONITOR | 集群监控面板</title>
+<title>K38 DLT | 集群监控面板</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
 <meta http-equiv="refresh" content="5">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'JetBrains Mono',monospace;overflow-x:hidden;background:#050510;color:#aab}
-canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.35;pointer-events:none}
+body{font-family:'JetBrains Mono',monospace;overflow-x:hidden;background:#050510;color:#aab;font-size:13px}
+canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.25;pointer-events:none}
 .scanline{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.03) 2px,rgba(0,0,0,.03) 4px)}
-#app{position:relative;z-index:1;max-width:1340px;margin:0 auto;padding:12px;margin-left:160px}
-.header{text-align:center;padding:4px 0 0}
-.header h1{font-family:'Orbitron',sans-serif;font-size:22px;color:#0ff;letter-spacing:4px;text-shadow:0 0 20px #0ff6}
-.header .sub{font-size:10px;color:#334;letter-spacing:2px;margin-top:2px}
-.topbar{display:flex;justify-content:space-between;align-items:center;padding:2px 0;font-size:9px;color:#445;border-bottom:1px solid #12122a;margin-bottom:6px}
-.theme-switch{display:flex;gap:4px}
-.theme-btn{font-size:8px;padding:2px 6px;border:1px solid #1a1a3a;border-radius:3px;background:transparent;color:#445;cursor:pointer;font-family:'Orbitron',sans-serif;letter-spacing:1px;transition:.2s}
-.theme-btn:hover{color:#aab;border-color:#3a3a5a}
-.theme-btn.active{color:#0ff;border-color:#0ff;text-shadow:0 0 6px #0ff4;background:rgba(0,255,255,.05)}
-.status-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;vertical-align:middle}
-.status-dot.online{background:#0f0;box-shadow:0 0 4px #0f0;animation:pulse-dot 2s ease-in-out infinite}
-@keyframes pulse-dot{0%,100%{opacity:1;box-shadow:0 0 6px #0f0}50%{opacity:0.65;box-shadow:0 0 14px #0f0}}
-.status-dot.offline{background:#f44;box-shadow:0 0 4px #f44}
-.sys-card{min-height:130px}
-.section-label{font-family:'Orbitron',sans-serif;font-size:12px;letter-spacing:3px;margin:10px 0 6px;padding-bottom:2px;text-shadow:0 0 8px #0ff4}
-.section-label .icon{margin-right:6px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;margin:4px 0}
-.card{background:#08081a;border:1px solid #1a1a3a;border-radius:6px;padding:8px;box-shadow:0 0 15px #0006;min-height:60px}
-.card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
-.card-title{font-family:'Orbitron',sans-serif;font-size:11px;letter-spacing:1px;display:flex;align-items:center;gap:4px}
-.card-title.online{color:#0ff}.card-title.offline{color:#334}.sys-card-placeholder{border-top:2px solid #222!important;opacity:.35}
-.card-ts{font-size:8px;color:#335}
-.gg{text-align:center;min-width:52px;display:inline-block;margin:2px}
-.sparkline{display:inline-block;margin:4px 2px 0;border-radius:4px;background:rgba(0,0,0,.2)}
-.gpu-tag{font-size:7px;color:#448;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block}
-.sys-load,.sys-up{font-size:7px;color:#445;padding:1px 4px}
-.gpu-clk{color:#0f0;font-size:8px;margin-left:6px}
-.fan-speed{color:#08f;font-size:8px;margin-left:6px}
-.empty-state{text-align:center;padding:10px 0;color:#445;font-size:10px}
-.empty-state .icon{font-size:20px}
-.dl-list{list-style:none;padding:0;margin:0}
-.dl-item{padding:3px 0;border-bottom:1px solid #0a0a1e}
-.dl-item:last-child{border-bottom:none}
-.dl-row{display:flex;align-items:center;gap:4px}
-.dl-name{flex:1;font-size:10px;color:#bbc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dl-bar{height:4px;background:#0a0a1a;border-radius:2px;margin:2px 0;overflow:hidden}
-.dl-bar-fill{height:100%;border-radius:2px;transition:width .5s}
-.dl-bar-fill.dl-down{background:linear-gradient(90deg,#0f8,#0ff);box-shadow:0 0 4px #0ff6}
-.dl-bar-fill.dl-finish{background:linear-gradient(90deg,#fa0,#ff0);box-shadow:0 0 4px #fa06}
-.dl-bar-fill.dl-done{background:#446}
-.dl-meta{font-size:8px;color:#556;display:flex;gap:8px}
-.pct{font-weight:bold;font-size:10px}.pct-low{color:#0ff}.pct-mid{color:#fa0}.pct-ok{color:#0f0}
-.net-card{text-align:center;padding:6px;min-height:30px}
-.net-row{font-size:11px;display:flex;justify-content:center;gap:16px;align-items:center;padding:2px 0}
-.net-link{font-size:9px;color:#556;display:inline-flex;align-items:center;gap:4px;margin:0 6px}
-.net-top{border-bottom:1px solid rgba(255,170,0,.15);margin-bottom:6px;padding-bottom:4px}
-.net-200g{display:flex;align-items:center;gap:6px;font-size:10px;justify-content:center}
-.net-200g-icon{color:#fa0;font-size:14px;filter:drop-shadow(0 0 4px #fa06)}
-.net-200g-label{font-family:'Orbitron',sans-serif;font-size:9px;color:#fa0;letter-spacing:1px}
-.net-200g-nodes{color:#556;font-size:9px}
-.net-200g-lat{font-family:'Orbitron',sans-serif;font-size:10px;font-weight:bold}
-.net-tb-link{font-size:8px;color:#445;text-align:center;margin:1px 0}
-.net-tb-speed{color:#556}
-.net-ping-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:5px}
-.np-card{background:rgba(10,10,26,.6);border:1px solid rgba(26,26,58,.3);border-radius:4px;padding:5px;text-align:center;min-height:40px}
-.np-head{display:flex;align-items:center;justify-content:center;gap:4px;margin-bottom:3px}
-.np-dot{width:5px;height:5px;border-radius:50%;flex-shrink:0}
-.np-dot.s-green{background:#0f0;box-shadow:0 0 4px #0f0}
-.np-dot.s-gray{background:#334}
-.np-name{font-size:9px;color:#bbc;font-family:'Orbitron',sans-serif;letter-spacing:1px}
-.np-pings{display:flex;justify-content:center;gap:8px;margin:2px 0}
-.np-ping{display:flex;align-items:center;gap:3px}
-.np-label{font-size:7px;color:#445}
-.np-val{font-size:13px;font-weight:bold;font-family:'Orbitron',sans-serif;min-width:22px;text-align:right}
-.np-val.c-green{color:#0f0;text-shadow:0 0 6px #0f06}
-.np-val.c-yellow{color:#fa0;text-shadow:0 0 6px #fa06}
-.np-val.c-red{color:#f44;text-shadow:0 0 6px #f46}
-.np-loc{font-size:6px;color:#334;margin-top:2px}
-.pg-grid{display:grid;gap:2px;margin-top:3px;padding-top:3px;grid-template-columns:44px repeat(6,1fr)}
-.pg-grid>div{padding:3px 2px;font-size:7px;text-align:center;border-radius:2px;display:flex;align-items:center;justify-content:center;min-height:18px}
-.ph{color:#445;font-size:7px;font-weight:bold;background:rgba(26,26,58,.3);padding:3px 2px;flex-direction:column;gap:1px}
-.ph img.pgi{width:14px;height:14px;border-radius:2px}
-.ph .sn{color:#667;font-size:6px;margin-top:1px;max-width:40px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pr{color:#667;font-size:7px;font-weight:bold;background:rgba(26,26,58,.2);padding:3px 3px;text-align:right;justify-content:flex-end;white-space:nowrap}
-.na{color:#334;font-size:6px}
-.tog{display:flex;align-items:center;gap:4px;padding:3px 5px;margin-top:3px;border-top:1px solid rgba(26,26,58,.3);cursor:pointer;user-select:none;transition:all .2s;border-radius:3px}
-.tog:hover{background:rgba(0,255,255,.04)}
-.tog-i{font-size:6px;transition:transform .2s;color:#556;display:inline-block}
-.tog-t{font-size:8px;color:#556;letter-spacing:1px}
-.tog-b{font-size:6px;color:#445;background:rgba(26,26,58,.3);padding:1px 3px;border-radius:2px}
-.tog.ex{background:rgba(0,255,255,.05);border-top-color:rgba(0,255,255,.15)}
-.tog.ex .tog-i{color:#0ff;transform:rotate(90deg)}
-.tog.ex .tog-t{color:#0ff}
-.tog.ex .tog-b{color:#0ff;background:rgba(0,255,255,.1)}
-.leg{margin-left:auto;display:flex;gap:5px;align-items:center}
-.leg-i{display:flex;align-items:center;gap:2px;font-size:6px;color:#445}
-.leg-d{width:4px;height:4px;border-radius:50%;display:inline-block}
-.net-matrix-wrap{display:none}
-.net-matrix-wrap.open{display:block}
+#app{position:relative;z-index:1;max-width:1100px;margin:0 auto;padding:10px}
+.wrap{display:flex;gap:8px}
+.sidebar{width:130px;flex-shrink:0;background:linear-gradient(180deg,rgba(8,12,24,0.92),rgba(12,18,32,0.88));border:1px solid rgba(0,255,255,0.08);border-radius:8px;padding:8px;height:fit-content}
+.sidebar .logo{font-family:'Orbitron',sans-serif;font-size:13px;color:#0ff;letter-spacing:3px;text-shadow:0 0 12px #0ff4;text-align:center;padding:6px 0 8px;border-bottom:1px solid rgba(0,255,255,.08)}
+.sidebar .nav-item{display:flex;align-items:center;gap:6px;padding:6px 8px;color:#445;font-size:10px;cursor:pointer;border-radius:4px;margin:2px 0;transition:.2s}
+.sidebar .nav-item:hover{color:#0ff;background:rgba(0,255,255,.06)}
+.sidebar .nav-item.active{color:#0ff;background:rgba(0,255,255,.08)}
+.main{flex:1;min-width:0}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.header h1{font-family:'Orbitron',sans-serif;font-size:18px;color:#0ff;letter-spacing:3px;text-shadow:0 0 15px #0ff4}
+.header .status-tag{font-size:10px;padding:3px 8px;border:1px solid rgba(0,255,255,.15);border-radius:4px;display:flex;align-items:center;gap:4px}
+.metric-row{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:8px}
+.metric-card{background:#08081a;border:1px solid #1a1a3a;border-radius:6px;padding:8px;text-align:center}
+.metric-card .val{font-size:24px;font-weight:700;font-family:'Orbitron',sans-serif}
+.metric-card .lbl{font-size:10px;color:#556;margin-top:2px}
+.metric-card .val.green{color:#4ade80;text-shadow:0 0 8px #4ade8044}
+.metric-card .val.cyan{color:#22d3ee;text-shadow:0 0 8px #22d3ee44}
+.metric-card .val.yellow{color:#fbbf24;text-shadow:0 0 8px #fbbf2444}
+.nodes-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-bottom:8px}
+.node-card{background:#08081a;border:1px solid #1a1a3a;border-radius:6px;padding:8px;cursor:pointer;transition:.2s}
+.node-card:hover{border-color:#0ff4;background:rgba(8,8,26,0.95)}
+.node-card .hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+.node-card .hdr .nm{font-family:'Orbitron',sans-serif;font-size:10px;letter-spacing:0.5px;display:flex;align-items:center;gap:3px}
+.node-card .hdr .nm.online{color:#0ff}
+.node-card .hdr .nm.offline{color:#334}
+.node-card .hdr .dot{width:6px;height:6px;border-radius:50%}
+.node-card .hdr .dot.on{background:#4ade80;box-shadow:0 0 4px #4ade80;animation:pulse-dot 2s ease-in-out infinite}
+.node-card .hdr .dot.off{background:#f44;box-shadow:0 0 4px #f44}
+@keyframes pulse-dot{0%,100%{opacity:1;box-shadow:0 0 6px #4ade80}50%{opacity:0.65;box-shadow:0 0 14px #4ade80}}
+.node-card .info{font-size:8px;color:#556;margin-bottom:2px}
+.node-card .gbar{height:4px;background:#0a0a1e;border-radius:2px;margin:3px 0;overflow:hidden}
+.node-card .gfill{height:100%;border-radius:2px}
+.node-card .gfill.ok{background:linear-gradient(90deg,#0f8,#0ff)}
+.node-card .gfill.warn{background:linear-gradient(90deg,#fa0,#ff0)}
+.node-card .gfill.hot{background:linear-gradient(90deg,#f44,#f88)}
+.node-card .rl{display:flex;justify-content:space-between;font-size:9px;color:#556;line-height:1.2}
+.node-card .detail{display:none;margin-top:6px;padding:6px;background:#0f0f1e;border-radius:4px;font-size:9px;line-height:1.5;border:1px solid #1a1a3a}
+.node-card .detail.show{display:block}
+.node-card .detail .row{display:flex;justify-content:space-between;padding:1px 0}
+.node-card .detail .row .k{color:#556}
+.node-card .detail .row .v{color:#bbc}
+@media(max-width:900px){.nodes-grid{grid-template-columns:repeat(3,1fr)}.sidebar{width:100px;padding:6px}.sidebar .nav-item{font-size:9px;padding:4px 6px}.bot-bar{font-size:9px;gap:8px}}
+@media(max-width:700px){.sidebar{display:none}.wrap{display:block}.main{width:100%}.nodes-grid{grid-template-columns:repeat(2,1fr)}.metric-row{grid-template-columns:repeat(2,1fr);gap:4px}.header h1{font-size:14px}.header .status-tag{font-size:8px}}
+@media(max-width:600px){#app{padding:4px}.nodes-grid{grid-template-columns:1fr 1fr;gap:3px}.node-card{padding:3px;cursor:default}.node-card .hdr .nm{font-size:8px}.node-card .rl{font-size:7px;line-height:1}.node-card .gbar{height:3px;margin:1px 0}.node-card .hdr{margin-bottom:2px}.metric-card{padding:4px}.metric-card .val{font-size:16px}.metric-card .lbl{font-size:7px}}@media(max-width:400px){.nodes-grid{grid-template-columns:1fr;gap:3px}.metric-row{grid-template-columns:1fr 1fr}}
+.bot-bar{margin-top:8px;padding:4px 8px;background:#08081a;border:1px solid #1a1a3a;border-radius:6px;display:flex;gap:8px;font-size:10px;color:#556;flex-wrap:wrap}
+.bot-bar b{color:#bbc}
+.bot-bar .sep{color:#1a1a3a}
 .footer{text-align:center;color:#224;font-size:9px;margin-top:10px}
 .footer a{color:#448;text-decoration:none}
-@media(max-width:600px){.grid{grid-template-columns:1fr}.header h1{font-size:16px}}
-/* Alert banner */
+.status-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;vertical-align:middle}
+.status-dot.online{background:#0f0;box-shadow:0 0 4px #0f0;animation:pulse-dot 2s ease-in-out infinite}
+.status-dot.offline{background:#f44;box-shadow:0 0 4px #f44}
+.status-dot.done{background:#446}
 .alert-banner{position:sticky;top:0;z-index:50;padding:6px 12px;margin-bottom:6px;border-radius:4px;font-size:9px;display:none;align-items:center;gap:8px;font-family:'JetBrains Mono',monospace;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:all 0.3s;cursor:pointer}
 .alert-banner.visible{display:flex}
 .alert-banner.critical{background:rgba(255,40,40,0.12);border:1px solid rgba(255,40,40,0.35);color:#f66;box-shadow:0 0 20px rgba(255,40,40,0.08)}
 .alert-banner.warning{background:rgba(255,170,0,0.10);border:1px solid rgba(255,170,0,0.30);color:#fa0;box-shadow:0 0 20px rgba(255,170,0,0.06)}
-.alert-banner .alert-count{font-weight:bold;font-size:11px;margin-right:4px}
-.alert-banner .alert-items{flex:1;display:flex;gap:10px;flex-wrap:wrap}
-.alert-banner .alert-item{display:flex;align-items:center;gap:4px}
-.alert-banner .alert-sev{font-size:7px;padding:1px 4px;border-radius:2px;text-transform:uppercase;font-weight:bold}
-.alert-banner .alert-sev.critical{background:rgba(255,40,40,0.2);color:#f44}
-.alert-banner .alert-sev.warning{background:rgba(255,170,0,0.2);color:#fa0}
-.alert-banner .alert-dismiss{opacity:0.3;cursor:pointer;font-size:12px;padding:2px 4px}
-.alert-banner .alert-dismiss:hover{opacity:0.8}
 </style>
-<style id="theme-s360">
-/* Server360 Lite: glass cards, colored section bands */
-.theme-s360 .card{background:linear-gradient(135deg,rgba(12,12,30,.88),rgba(8,8,24,.92));border:1px solid rgba(26,26,58,.5);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);box-shadow:0 4px 20px rgba(0,0,0,.5);transition:.25s}
-.theme-s360 .card:hover{box-shadow:0 4px 30px rgba(0,255,255,.08);border-color:rgba(60,60,100,.6)}
-.theme-s360 .card-header{border-bottom:1px solid rgba(26,26,58,.4);margin-bottom:6px;padding-bottom:4px}
-.theme-s360 .section-label{font-size:10px;color:#667;letter-spacing:4px;text-transform:uppercase;border-bottom:none;margin:12px 0 8px;display:flex;align-items:center;gap:8px}
-.theme-s360 .section-label::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,rgba(26,26,58,.6),transparent)}
-.theme-s360 .section-label .badge{font-size:7px;padding:1px 6px;border-radius:2px;font-family:'JetBrains Mono',monospace;letter-spacing:1px;margin-left:4px}
-.theme-s360 .section-label.sys-label .badge{color:#0ff;border:1px solid rgba(0,255,255,.3);background:rgba(0,255,255,.05)}
-.theme-s360 .section-label.net-label .badge{color:#fa0;border:1px solid rgba(255,170,0,.3);background:rgba(255,170,0,.05)}
-.theme-s360 .section-label.dl-label .badge{color:#f4f;border:1px solid rgba(255,68,255,.3);background:rgba(255,68,255,.05)}
-.theme-s360 .section-label.job-label .badge{color:#fd0;border:1px solid rgba(255,221,0,.3);background:rgba(255,221,0,.05)}
-.job-card{border-left:3px solid #fd06;background:rgba(20,18,8,.9);min-height:50px}
-.job-card .job-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
-.job-card .job-name{font-size:10px;color:#bbc;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.job-card .job-type{font-size:7px;padding:1px 5px;border-radius:2px;margin-left:6px;flex-shrink:0}
-.job-card .job-type.content{color:#fd0;border:1px solid rgba(255,221,0,.3)}
-.job-card .job-type.code{color:#0ff;border:1px solid rgba(0,255,255,.3)}
-.job-card .job-progress{height:5px;background:rgba(10,10,26,.6);border-radius:3px;overflow:hidden;margin:4px 0}
-.job-card .job-progress-fill{height:100%;border-radius:3px;transition:width .5s;background:linear-gradient(90deg,#fa0,#fd0);box-shadow:0 0 8px #fd06}
-.job-card .job-progress-fill.job-done{background:#446;box-shadow:none}
-.job-card .job-timers{display:flex;gap:12px;font-size:8px;color:#556}
-.job-card .job-timers .job-elapsed{color:#bbc}
-.job-card .job-timers .job-eta{color:#fd0;font-weight:bold}
-.job-card .job-detail{font-size:7px;color:#445;margin-top:2px}
-.job-card .job-node{font-size:7px;color:#334;text-align:right}
-.job-empty{text-align:center;padding:20px 0;color:#445;font-size:10px}
-.job-empty .icon{font-size:24px;margin-bottom:6px}
-.theme-s360 .card-title{font-size:10px;letter-spacing:2px}
-.theme-s360 .card-ts{font-size:7px;padding:1px 4px;border-radius:2px;background:rgba(0,255,255,.04);border:1px solid rgba(0,255,255,.1)}
-.theme-s360 .gg{filter:drop-shadow(0 0 2px rgba(0,255,255,.1))}
-.theme-s360 .dl-item{padding:4px 0;border-bottom:1px solid rgba(255,255,255,.03)}
-.theme-s360 .dl-bar{height:3px;background:rgba(10,10,30,.6)}
-.theme-s360 .dl-name{font-size:9px}
-.theme-s360 .net-card{background:linear-gradient(135deg,rgba(20,18,10,.88),rgba(12,10,8,.92))}
-.theme-s360 .net-row{font-size:10px}
-.theme-s360 .gpu-tag{font-size:6px;color:#556}.gpu-alert{display:inline-block;font-size:6px;padding:1px 4px;border-radius:2px;background:#f44;color:#fff;animation:gpu-blink 1s infinite;margin-left:4px;vertical-align:middle}
-@keyframes gpu-blink{0%,100%{opacity:1}50%{opacity:.3}}
-.theme-s360 .sys-load,.theme-s360 .sys-up{font-size:6px;color:#334}
-</style>
-<style id="theme-netdata">
-/* Netdata: left color strip, prominent metrics */
-.theme-netdata .card{background:#0e0e20;border:none;border-radius:4px;padding:8px 10px;box-shadow:0 1px 4px rgba(0,0,0,.4);position:relative;overflow:hidden}
-.theme-netdata .card::before{content:'';position:absolute;left:0;top:4px;bottom:4px;width:4px;border-radius:2px}
-.theme-netdata .card.sys-card::before{background:#0ff;box-shadow:0 0 6px #0ff6}
-.theme-netdata .card.net-card::before{background:#fa0;box-shadow:0 0 6px #fa06}
-.theme-netdata .card.dl-card::before{background:#f4f;box-shadow:0 0 6px #f4f6}
-.theme-netdata .card-header{border-bottom:1px solid rgba(255,255,255,.05);margin-bottom:6px;padding:0 0 4px}
-.theme-netdata .card-title{font-size:10px;letter-spacing:1px;color:#0ff}
-.theme-netdata .card-ts{font-size:7px;color:#334}
-.theme-netdata .section-label{font-size:10px;border-bottom:none;display:flex;align-items:center;gap:6px;color:#556}
-.theme-netdata .section-label .swatch{display:inline-block;width:8px;height:8px;border-radius:2px}
-.theme-netdata .section-label.sys-label .swatch{background:#0ff;box-shadow:0 0 6px #0ff6}
-.theme-netdata .section-label.net-label .swatch{background:#fa0;box-shadow:0 0 6px #fa06}
-.theme-netdata .section-label.dl-label .swatch{background:#f4f;box-shadow:0 0 6px #f4f6}
-.theme-netdata .gg svg{filter:none!important}
-.theme-netdata .dl-bar{height:6px;background:#0a0a18;border-radius:3px}
-.theme-netdata .dl-bar-fill{border-radius:3px}
-.theme-netdata .dl-name{font-size:10px;font-weight:bold;color:#bbc}
-.theme-netdata .dl-meta{font-size:7px;color:#445}
-.theme-netdata .pct{font-size:11px}
-.theme-netdata .net-card{padding:8px 12px}
-.theme-netdata .net-row{font-size:10px;justify-content:flex-start;gap:12px}
-.theme-netdata .net-link{font-size:8px}
-/* Sidebar - glassmorphism redesign */
-.sidebar{position:fixed;left:0;top:0;width:160px;height:100vh;background:linear-gradient(180deg,rgba(8,12,24,0.92),rgba(12,18,32,0.88) 60%,rgba(6,10,20,0.94));backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-right:1px solid rgba(0,255,255,0.08);box-shadow:2px 0 30px rgba(0,0,0,0.5),inset -1px 0 0 rgba(0,255,255,0.04);z-index:100;display:flex;flex-direction:column;padding:0;transition:width 0.3s ease,box-shadow 0.3s}
-.sidebar:hover{width:180px;box-shadow:4px 0 40px rgba(0,0,0,0.6),inset -1px 0 0 rgba(0,255,255,0.08)}
-.sidebar-title{text-align:center;color:#0ff;font-size:11px;letter-spacing:4px;padding:14px 10px 10px;border-bottom:1px solid rgba(0,255,255,0.08);font-family:'Orbitron',sans-serif;text-shadow:0 0 15px rgba(0,255,255,0.2);position:relative}
-.sidebar-title::after{content:'';position:absolute;bottom:-1px;left:10%;width:80%;height:1px;background:linear-gradient(90deg,transparent,rgba(0,255,255,0.2),transparent)}
-.sidebar-nav{flex:1;overflow-y:auto;padding:6px 0;position:relative}
-.nav-item{display:flex;align-items:center;padding:8px 12px;color:#445;font-size:10px;cursor:pointer;transition:all 0.25s cubic-bezier(0.4,0,0.2,1);border-left:2px solid transparent;letter-spacing:1px;margin:1px 6px;border-radius:0 4px 4px 0;position:relative;overflow:hidden}
-.nav-item::before{content:'';position:absolute;left:0;top:0;width:100%;height:100%;background:linear-gradient(90deg,rgba(0,255,255,0.06),transparent 60%);opacity:0;transition:opacity 0.3s;pointer-events:none}
-.nav-item:hover{color:#0ff;border-left-color:#0ff;background:rgba(0,255,255,0.06);text-shadow:0 0 8px rgba(0,255,255,0.3)}
-.nav-item:hover::before{opacity:1}
-.nav-item.active{color:#0ff;border-left-color:#0ff;background:rgba(0,255,255,0.08);text-shadow:0 0 10px rgba(0,255,255,0.4);box-shadow:inset 0 0 20px rgba(0,255,255,0.04),0 0 10px rgba(0,255,255,0.05);animation:nav-glow 3s ease-in-out infinite}
-@keyframes nav-glow{0%,100%{box-shadow:inset 0 0 20px rgba(0,255,255,0.04),0 0 10px rgba(0,255,255,0.05)}50%{box-shadow:inset 0 0 20px rgba(0,255,255,0.08),0 0 16px rgba(0,255,255,0.08)}}
-.sidebar-bottom{margin-top:auto;padding:10px 8px}
-/* Theme switch in sidebar */
-.stheme-switch{display:flex;gap:4px;padding:2px;border-radius:5px;background:rgba(0,255,255,0.03);border:1px solid rgba(0,255,255,0.05)}
-.stheme-btn{flex:1;padding:5px 0;font-size:8px;background:transparent;border:none;color:#445;cursor:pointer;border-radius:3px;text-align:center;font-family:'Orbitron',sans-serif;letter-spacing:1px;transition:all 0.25s cubic-bezier(0.4,0,0.2,1);position:relative}
-.stheme-btn:hover{color:#889}
-.stheme-btn.active{color:#0ff;background:rgba(0,255,255,0.1);box-shadow:0 0 12px rgba(0,255,255,0.1);text-shadow:0 0 8px #0ff4}
-/* Netdata sidebar */
-body.theme-netdata .sidebar{background:linear-gradient(180deg,rgba(24,12,8,0.92),rgba(28,16,10,0.88) 60%,rgba(20,10,6,0.94));backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-right-color:rgba(255,160,0,0.08);box-shadow:2px 0 30px rgba(0,0,0,0.5),inset -1px 0 0 rgba(255,160,0,0.04)}
-body.theme-netdata .sidebar:hover{box-shadow:4px 0 40px rgba(0,0,0,0.6),inset -1px 0 0 rgba(255,160,0,0.08)}
-body.theme-netdata .sidebar-title{color:#fa0;border-bottom-color:rgba(255,160,0,0.08);text-shadow:0 0 15px rgba(255,160,0,0.2)}
-body.theme-netdata .sidebar-title::after{background:linear-gradient(90deg,transparent,rgba(255,160,0,0.2),transparent)}
-body.theme-netdata .nav-item{color:#654}
-body.theme-netdata .nav-item::before{background:linear-gradient(90deg,rgba(255,160,0,0.06),transparent 60%)}
-body.theme-netdata .nav-item:hover{color:#fa0;border-left-color:#fa0;background:rgba(255,160,0,0.06);text-shadow:0 0 8px rgba(255,160,0,0.3)}
-body.theme-netdata .nav-item.active{color:#fa0;border-left-color:#fa0;background:rgba(255,160,0,0.08);text-shadow:0 0 10px rgba(255,160,0,0.4);box-shadow:inset 0 0 20px rgba(255,160,0,0.04),0 0 10px rgba(255,160,0,0.05);animation:nav-glow-nd 3s ease-in-out infinite}
-@keyframes nav-glow-nd{0%,100%{box-shadow:inset 0 0 20px rgba(255,160,0,0.04),0 0 10px rgba(255,160,0,0.05)}50%{box-shadow:inset 0 0 20px rgba(255,160,0,0.08),0 0 16px rgba(255,160,0,0.08)}}
-body.theme-netdata .stheme-switch{background:rgba(255,160,0,0.03);border-color:rgba(255,160,0,0.05)}
-body.theme-netdata .stheme-btn{color:#654}
-body.theme-netdata .stheme-btn.active{color:#fa0;background:rgba(255,160,0,0.1);box-shadow:0 0 12px rgba(255,160,0,0.1);text-shadow:0 0 8px #fa04}
-/* Topo */
-.topo-map{padding:6px 6px;border-bottom:1px solid rgba(0,255,255,0.06);margin-bottom:6px}
-.topo-row{display:flex;justify-content:center;gap:14px;margin:1px 0}
-.topo-node{width:8px;height:8px;border-radius:50%;margin:0 auto;transition:all 0.3s}
-.topo-line{width:2px;height:8px;background:rgba(0,255,255,0.08);margin:0 auto}
-.topo-ceo{background:#fd0;box-shadow:0 0 5px #fd0}
-.topo-coo{background:#0ff;box-shadow:0 0 5px #0ff}
-.topo-cto{background:#f0f;box-shadow:0 0 5px #f0f}
-.topo-dgx{background:#0f0;box-shadow:0 0 5px #0f0}
-body.theme-netdata .topo-map{border-bottom-color:rgba(255,160,0,0.06)}
-body.theme-netdata .topo-line{background:rgba(255,160,0,0.08)}
-body.theme-netdata .sidebar-nav .nav-item{margin:1px 4px}
+/* === 编辑模式 === */
+.edit-mode .nodes-grid{max-width:55%}.edit-mode .metric-row{max-width:55%}.edit-mode .sidebar{display:none}.edit-mode .bot-bar{max-width:55%}.edit-mode .main{max-width:55%;padding-right:4px}
+#edit-panel{position:fixed;top:0;right:0;bottom:0;width:44%;background:#0c0c1e;border-left:1px solid #1a1a3a;z-index:9999;display:none;flex-direction:column;font-size:12px}
+#edit-panel .bar{display:flex;justify-content:space-between;align-items:center;padding:4px 8px;background:#0a0a1a;border-bottom:1px solid #1a1a3a}
+#edit-panel .bar button{background:0;border:1px solid #1a1a3a;color:#0ff;font-size:10px;padding:2px 8px;border-radius:4px;cursor:pointer}
+#edit-panel .bar button:hover{background:#1a1a3a}
+#edit-panel .bar .sp{color:#556;font-size:9px}
+#edit-panel textarea{flex:1;background:#0a0a18;color:#abc;border:0;padding:6px;font-size:11px;font-family:monospace;resize:none;outline:0;tab-size:2}
+#edit-panel .res{flex:0 0 30px;padding:3px 8px;background:#0a0a1a;border-top:1px solid #1a1a3a;font-size:9px;color:#556}
+#edit-panel .res.ok{color:#0f8}
+#edit-panel .res.err{color:#f44}
+.edit-btn{position:fixed;bottom:12px;right:12px;z-index:10000;background:#0a0a1a;border:1px solid #1a1a3a;color:#0ff;font-size:14px;padding:10px 18px;border-radius:6px;cursor:pointer;opacity:.8;transition:opacity .2s}
+.edit-btn:hover{opacity:1}
+@media(max-width:700px){#edit-panel{width:100%;font-size:10px}.edit-mode .main{max-width:100%}.edit-mode .nodes-grid{max-width:100%}.edit-mode .bot-bar{max-width:100%}}
 </style>
 </head><body>
+<button class="edit-btn" id="edit-btn" onclick="toggleEdit()">EDIT</button>
 <canvas id="bg"></canvas><div class="scanline"></div>
 <div id="app">
 <div class="alert-banner" id="alert-banner" onclick="this.classList.remove('visible')">
   <span class="alert-count" id="alert-count">0</span>
   <span class="alert-label">alert(s)</span>
   <span class="alert-items" id="alert-items"></span>
-  <span class="alert-dismiss">✖</span>
+  <span class="alert-dismiss">x</span>
 </div>
+<div class="wrap">
 <div class="sidebar">
-<div class="sidebar-title">▣ K38</div>
-<div class="sidebar-nav">
-<div class="nav-item" onclick="navTo(this,'sys-grid')">MONITOR</div>
-<div class="nav-item" onclick="navTo(this,'job-grid')">JOBS</div>
-<div class="nav-item" onclick="navTo(this,'net-section')">NET</div>
-<div class="nav-item" onclick="navTo(this,'dl-grid')">DL</div>
-<div class="nav-item" onclick="navTo(this,'svc-grid')">SVC</div>
-<div class="nav-item" onclick="navTo(this,'docker-grid')">DOCK</div>
-<div class="nav-item" onclick="navTo(this,'diskio-grid')">DISK</div>
+<div class="logo">K38</div>
+<div class="nav-item active" onclick="navTo(this,'sys-metrics')">[NODES]</div>
+<div style="margin-top:12px;padding-top:8px;border-top:1px solid rgba(0,255,255,.06);text-align:center;font-size:8px;color:#224">v{{VERSION}}</div>
 </div>
-<div class="sidebar-bottom">
-<div class="topo-map">
-<div class="topo-row"><div class="topo-node topo-ceo" title="十六万"></div></div>
-<div class="topo-line"></div>
-<div class="topo-row">
-<div class="topo-node topo-coo" title="三万八"></div>
-<div class="topo-node topo-cto" title="小四"></div>
+<div class="main" id="sys-metrics">
+<div class="header">
+<h1>K38 DLT</h1>
+<div class="status-tag"><span class="status-dot online"></span> <span id="node-count">{{ONLINE}}</span> | {{TS}}</div>
 </div>
-<div class="topo-line"></div>
-<div class="topo-row">
-<div class="topo-node topo-dgx" title="大傻"></div>
-<div class="topo-node topo-dgx" title="二傻"></div>
+<div class="metric-row">
+<div class="metric-card"><div class="val green" id="m-online">{{ONLINE}}</div><div class="lbl">节点在线</div></div>
+<div class="metric-card"><div class="val cyan" id="m-latency">{{LATENCY}}</div><div class="lbl">平均响应</div></div>
+<div class="metric-card"><div class="val yellow" id="m-temp">{{TEMP}}</div><div class="lbl">最高温度</div></div>
+<div class="metric-card"><div class="val cyan" id="m-uptime">{{UPTIME}}</div><div class="lbl">最长运行</div></div>
 </div>
+<div class="nodes-grid" id="node-grid">{{SYS_HTML}}</div>
+<div class="bot-bar">
+<span>Docker <b id="svc-docker">--</b></span>
+<span class="sep">|</span>
+<span>Ollama <b id="svc-ollama">--</b></span>
+<span class="sep">|</span>
+<span>200G <b id="svc-200g">--</b></span>
 </div>
-<div class="stheme-switch">
-<span class="stheme-btn active" data-theme="s360" onclick="switchTheme('s360')">S360</span>
-<span class="stheme-btn" data-theme="netdata" onclick="switchTheme('netdata')">ND</span>
+
+<div class="footer"><a href="https://github.com/kk38/dltrace" target="_blank">dltrace</a> | {{VERSION}} | {{TS}}</div>
+</div></div></div></div>
+
+<!-- 编辑面板 -->
+<div id="edit-panel">
+<div class="bar"><span style="color:#0ff;font-size:11px;font-family:Orbitron,sans-serif">EDIT</span><span class="sp">CSS // HTML</span><button onclick="applyEdit()">▶ 应用</button><button onclick="toggleEdit()" style="margin-left:4px">✕</button></div>
+<textarea id="edit-area" spellcheck="false"></textarea>
+<div class="res" id="edit-res">Ctrl+Enter 应用</div>
 </div>
-</div>
-</div>
-<div class="header"><h1>▣ K38 MONITOR</h1><div class="sub">CLUSTER DASHBOARD · {{VERSION}}</div></div>
-<div class="topbar">
-<div class="theme-switch">
-<span class="theme-btn active" data-theme="s360" onclick="switchTheme('s360')">SERVER360</span>
-<span class="theme-btn" data-theme="netdata" onclick="switchTheme('netdata')">NETDATA</span>
-</div>
-<span>{{STATUS_BAR}}<span style="margin-left:8px;color:#224">5s · auto</span></span>
-</div>
-<div class="section-label sys-label"><span class="icon">&#x2699;</span> SYSTEM MONITORING</div>
-<div class="grid" id="sys-grid">{{SYS_HTML}}</div>
-<div class="section-label net-label"><span class="icon">&#x1f517;</span> NETWORK LINKS</div>
-<div id="net-section">{{NET_HTML}}</div>
-<div class="section-label dl-label"><span class="icon">&#x1f4e5;</span> ACTIVE DOWNLOADS</div>
-<div class="grid" id="dl-grid">{{DL_HTML}}</div>
-<div class="section-label job-label"><span class="icon">&#x23f3;</span> CONTENT PRODUCTION</div>
-<div class="grid" id="job-grid">{{JOB_HTML}}</div>
-<div class="section-label sys-label" style="font-size:11px;letter-spacing:3px;margin:10px 0 6px;color:#0f8;font-family:'Orbitron',sans-serif">&#x1f4ca; DISK I/O</div>
-<div class="grid" id="diskio-grid"></div>
-<div class="section-label sys-label" style="font-size:11px;letter-spacing:3px;margin:10px 0 6px;color:#0ff;font-family:'Orbitron',sans-serif">&#x1f433; DOCKER CONTAINERS</div>
-<div class="grid" id="docker-grid"></div>
-<div class="footer"><a href="https://github.com/kk38/dltrace" target="_blank">dltrace</a> · {{VERSION}} · {{TS}}</div>
-</div>
+
 <script>
-var POLL=2500,_hist={};
-function $(id){return document.getElementById(id)}
-function esc(s){if(s==null)return'';var d=document.createElement('div');d.appendChild(document.createTextNode(String(s)));return d.innerHTML}
-function pctCls(p){return p>=100?'pct-ok':p>50?'pct-mid':'pct-low'}
-function barCls(s){return s==='done'||s==='stale'?'dl-done':s==='finishing'?'dl-finish':'dl-down'}
-function tagIcon(t){var tl=(t||'').toLowerCase();if(tl.match(/model|qwen|llm|safetensors/))return'\uD83E\uDDE0';if(tl.match(/archive|tar|gz|zip/))return'\uD83D\uDDDC\uFE0F';if(tl.match(/git|clone/))return'\uD83D\uDD00';if(tl.match(/pip|python/))return'\uD83D\uDC0D';if(tl.match(/docker|image/))return'\uD83D\uDC33';if(tl.match(/video|mp4|movie/))return'\uD83C\uDFAC';return'\uD83D\uDCC4'}
-function fmtSize(mb){if(mb>=1024)return(mb/1024).toFixed(1)+'GB';return Math.round(mb)+'MB'}
-function fmtKb(kb){if(kb>=1024)return(kb/1024).toFixed(1)+'MB/s';return Math.round(kb)+'KB/s'}
-function renderSparkline(vals,color,h){if(!vals||vals.length<2)return'';var mx=Math.max.apply(null,vals),mn=Math.min.apply(null,vals);var rng=mx-mn||1,bw=Math.max(3,Math.min(6,80/vals.length));var bars=vals.map(function(v){var p=Math.max(5,Math.min(100,(v-mn)/rng*100));return'<div style="width:'+bw+'px;height:'+p+'%;background:'+color+';border-radius:1px;opacity:0.5"></div>';}).join('');return'<div style="display:flex;align-items:flex-end;gap:1px;height:'+h+'px;margin-top:3px">'+bars+'</div>';}
-function sparkline(data,color,w,h){if(!data||data.length<3)return'';var vals=[],i;for(i=0;i<data.length;i++)vals.push(data[i][1]);var vmin=Math.min.apply(null,vals),vmax=Math.max.apply(null,vals);if(vmax-vmin<.1){vmin-=1;vmax+=1}var rng=vmax-vmin;var pts='';for(i=0;i<vals.length;i++){pts+=(i/(vals.length-1)*w).toFixed(1)+','+(h-(vals[i]-vmin)/rng*(h-4)-2).toFixed(1)+' '}
-var gid='sg_'+Math.abs(Math.floor(Math.random()*99999));return'<svg class="sparkline" width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'"><defs><linearGradient id="'+gid+'" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="'+color+'" stop-opacity="0.3"/><stop offset="100%" stop-color="'+color+'" stop-opacity="0.02"/></linearGradient></defs><polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><polygon points="0,'+h+' '+pts+' '+w+','+h+'" fill="url(#'+gid+')"/></svg>';}
-function gauge(id,n,v,u,cl){var isT=n=='TMP'||n=='TMG'||n=='TMC';var c=cl||(isT?(v>75?'#f44':v>55?'#fa0':'#0f8'):(v>90?'#f44':v>70?'#fa0':'#0ff'));var p=Math.min(Math.max(v,0),100);var r=22,sw=5,cx=r+sw,cy=r+sw,sz=cx*2,circ=2*Math.PI*r,dash=circ*p/100;
-var h='<svg width="'+sz+'" height="'+sz+'" viewBox="0 0 '+sz+' '+sz+'"><circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="none" stroke="#0a0a1e" stroke-width="'+sw+'"/>'
-+'<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="none" stroke="'+c+'" stroke-width="'+sw+'" stroke-dasharray="'+dash+' '+Math.ceil(circ-dash)+'" stroke-linecap="round" transform="rotate(-90 '+cx+' '+cy+')" style="filter:drop-shadow(0 0 6px '+c+')"/>'
-+'<text x="'+cx+'" y="'+(cy-1)+'" text-anchor="middle" fill="#bbc" font-size="10px" font-weight="bold">'+Math.round(p)+'<tspan font-size="6px" fill="#556">'+u+'</tspan></text>'
-+'<text x="'+cx+'" y="'+(cy+9)+'" text-anchor="middle" fill="#445" font-size="6px">'+esc(n)+'</text></svg>';
-if(!_hist[id])_hist[id]=[];_hist[id].push(v);if(_hist[id].length>60)_hist[id].shift();
-var sl='';if(_hist[id].length>2){var mn=Math.min.apply(null,_hist[id]),mx=Math.max.apply(null,_hist[id]);if(mn===mx){mn-=1;mx+=1}var sp=110,sh=16,rng=mx-mn,pts=[];_hist[id].forEach(function(vv,ii){var x=ii/(_hist[id].length-1)*(sp-4)+2,y=sh-2-(vv-mn)/rng*(sh-4);pts.push(x.toFixed(1)+','+y.toFixed(1));});
-sl='<svg width="'+sp+'" height="'+sh+'" style="display:block;margin:1px auto"><polyline points="'+pts.join(' ')+'" fill="none" stroke="'+c+'" stroke-width="1" opacity=".5"/></svg>';}
-return '<div class="gg">'+h+sl+'</div>';}
-function sysCard(h,n){if(!n)return'<div class="card sys-card sys-card-placeholder"><div class="card-header"><span class="card-title offline"><span class="status-dot offline"></span>'+esc(FIXED_NAME[h]||h)+'</span><span class="card-ts">--:--:--</span></div><div style="display:flex;flex-wrap:wrap;justify-content:center;gap:2px;color:#334;font-size:9px;text-align:center;width:100%;padding-top:20px">⚠️ 暂无数据</div></div>';}
-var s=n.system||{};var nn=typeof NODE_NAMES!='undefined'?NODE_NAMES:{};var fn=nn[h]||(h.indexOf('.')>=0?h.split('.')[0]:h);
-var dots=n.tracked_total>0||(n.ts||0)>1700000000;var dc=dots?'online':'offline';
-var htm='<div class="card sys-card" style="border-top:2px solid '+(dots?'#0ff':'#222')+'"><div class="card-header"><span class="card-title '+dc+'"><span class="status-dot '+dc+'"></span>'+esc(fn)+'</span><span class="card-ts">'+(n.ts_str||'--:--:--')+'</span></div><div style="display:flex;flex-wrap:wrap;justify-content:center;gap:2px">';
-if(s.cpu_pct!==undefined)htm+=gauge('cpu_'+h,'CPU',s.cpu_pct,'%');else if(s.load_1m!==undefined)htm+=gauge('cpu_'+h,'LD',s.load_1m,'');
-if(s.mem_pct!==undefined)htm+=gauge('mem_'+h,'MEM',s.mem_pct,'%');
-if(s.gpu_pct!==undefined)htm+=gauge('gpu_'+h,'GPU',s.gpu_pct,'%');
-if(s.gpu_mem_used!==undefined&&s.gpu_mem_total!==undefined)htm+='<div style="width:100%;text-align:center;font-size:8px;color:#556;margin-top:1px">VRAM: '+fmtSize(s.gpu_mem_used)+' / '+fmtSize(s.gpu_mem_total)+'</div>';
-if(s.disk_pct!==undefined)htm+=gauge('dsk_'+h,'DSK',parseFloat(s.disk_pct),'%');
-if(s.gpu_temp!==undefined)htm+=gauge('tmp_'+h,'TMG',s.gpu_temp,'\u00b0')+(s.gpu_temp>85?' <span class="gpu-alert">HOT</span>':'');
-if(s.cpu_temp!==undefined)htm+=gauge('cpt_'+h,'TMC',s.cpu_temp,'\u00b0');
-var hist=n.history||{};if(hist.cpu)htm+=sparkline(hist.cpu,'#0ff',100,24);
-// GPU temp/power trend sparkline (div-based)
-var gt=n.gpu_trends||{};var gtKeys=Object.keys(gt);for(var gi=0;gi<gtKeys.length;gi++){if(gtKeys[gi]===h){var trend=gt[gtKeys[gi]];if(trend&&trend.length>=2){var temps=trend.map(function(x){return x.temp});var powers=trend.map(function(x){return x.power});
-htm+='<div style="width:100%;display:flex;gap:6px;justify-content:center;margin-top:2px">'+
-'<div style="text-align:center"><div style="font-size:6px;color:#556">TEMP \u00b0</div>'+renderSparkline(temps,'#f60',28)+'</div>'+
-'<div style="text-align:center"><div style="font-size:6px;color:#556">PWR W</div>'+renderSparkline(powers,'#fa0',28)+'</div></div>';}}}
-if(s.gpu_info)htm+='<div style="width:100%;text-align:center;margin-top:2px"><span class="gpu-tag" title="'+esc(s.gpu_info)+'">'+esc(s.gpu_info.substring(0,30))+'</span></div>';
-if(s.gpu_clk_graphics!==undefined&&s.gpu_clk_memory!==undefined)htm+='<span class="gpu-clk">⚡ '+esc(s.gpu_clk_graphics)+'MHz 💾 '+esc(s.gpu_clk_memory)+'MHz</span>';
-if(s.fan_rpm_avg!==undefined)htm+='<span class="fan-speed">❄ '+esc(s.fan_rpm_avg)+' RPM</span>';
-if(s.load)htm+='<div style="width:100%;text-align:center"><span class="sys-load">LD: '+esc(s.load)+'</span></div>';
-if(s.uptime)htm+='<div style="width:100%;text-align:center"><span class="sys-up">'+esc(s.uptime)+'</span></div>';
-htm+='</div></div>';return htm;}
-function dlCard(h,n){var f=n.active_files||[];var nn=typeof NODE_NAMES!='undefined'?NODE_NAMES:{};var fn=nn[h]||(h.indexOf('.')>=0?h.split('.')[0]:h);
-var dots=n.tracked_total>0||(n.ts||0)>1700000000;var dc=dots?'online':'offline';
-var htm='<div class="card dl-card"><div class="card-header"><span class="card-title '+dc+'"><span class="status-dot '+dc+'"></span>'+esc(fn)+'</span><span class="card-ts">\uD83D\uDCE6 '+n.tracked_total+'</span></div>';
-if(f.length){htm+='<ul class="dl-list">';
-for(var i=0;i<f.length;i++){var ff=f[i];var p=ff.pct||0;var sz=ff.size_mb||0;var sp=ff.speed_mb||0;var nm=ff.name||'';var st=ff.status||'';var ic=tagIcon(ff.tag);var bc=barCls(st);
-htm+='<li class="dl-item"><div class="dl-row"><span>'+ic+'</span><span class="dl-name" title="'+esc(nm)+'">'+esc(nm)+'</span><span class="pct '+pctCls(p)+'">'+p+'%</span></div><div class="dl-bar"><div class="dl-bar-fill '+bc+'" style="width:'+p+'%"></div></div><div class="dl-meta"><span>'+sz.toFixed(1)+' MB</span><span class="speed">'+(sp>0?sp.toFixed(2)+' MB/s':'')+'</span><span>'+st+'</span></div></li>';}
-htm+='</ul>'}else{htm+='<div class="empty-state"><div class="icon">\uD83D\uDCED</div><p>\u65E0\u6D3B\u8DC3\u4E0B\u8F7D</p></div>';}
-htm+='</div>';return htm;}
-var LOGOS={"baidu": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj42NDwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj42NDwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgohBDnEAAACk0lEQVQ4EaVTS0hUURj+7mPunWbU0Sl7OG0SM1PMRKRty1oURRRB2EOidhmkUQNiL4ImahEt2rVpLxSBWFpjgaljhmIa5jjjC3VGRkadO/cx93TOHb2ktYl+OPd1/v873/f9/wUhhKcrQNe/BqvhQS9/FHd9VkhnMGUBKmmTtL5ZISM/1L8dEGAAG6K7RyGlVVFSciBCBodU8vJVkuwsDpPDR6bJQszYkMteeGyK/gEVSppA14DhUQ3fRzQ4nTwmpw1MRPRN2YC4/mVm1kA4YqCiXIJrCwfTBMr3SVAUE6pKUFbqgMfD40OXgtoaGTnutbMZjeRyhhw/PUt8eycsyqGvadLTp7AtK9o7VsnPsEau34yRHXsmiL8lTkwzu2cxmKL0Rsd0SA4OwU8KLp7LBWP06GkC+R4B9edzYRjAl7403C6O3lVoGoEsc1kJRbtElBQ7MPBNRVWljPhiBmcvzGM8rEOgRwwMqnj+pNDKiUQN1FTLcEicpZ5jRNjT9IyBsXEd5WUSGprirDsQRQ7dvWmAZlypz8OlujwMDWs4VCsjNyfrgW3ibp9oFVxrjCMS1XG7MR+TUxlEJg0kkxm8bUtB0wn8TV6Iwrr1gN3GWDyDusvzqKyQ8OJZIaoPOi0W95u98BYIeHjXi/b3Kdy4Fad+WKQtFBug46NiaT51wg3/nUW0vl6B7OQgS0DGpHIEDi4Xj7Z3KZpHHV0LG8DhANJ0gDqDCu41b8Wxo24sUjOTyyYCD7aBSdSpBI56J/wmwTYxkTBxtWEBoX4V+6mR3gIeS0smdEqXSVimQGO0K2dO5qDF77VBGECAsmlijFZWTfSGsj32FYnw0fYyvVE6J3NzBrYXCnQKneBt3njMjPqv3/kXJUADijW0BeUAAAAASUVORK5CYII=", "youtube": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAAAw0lEQVQ4EaVTiw2FIAwsL28ANpARGIEV3MAR3UBHcATcgA14LfLRgI0+SAjl6J09qMJ7Dz3j00Mm7jcLCCEx1nFvMn4N1rjdwHsXYrKAJiacZObNnIJ9JOmXxPNHNN2BimX9swSB5LsWsBbAmBoviOJfYRgAlgVgnrFOVWiniBdIiVKmqFp5gX0HGMfDBtlpDOqDrYEfkMbrce72GA8sVWBvM3gy0aih+hpJ5J/p2spYO8hGZWvEcisXgUb2E4h/hQcKPzl8hRVGXE8aAAAAAElFTkSuQmCC", "github": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgqWsr5jAAACQElEQVQ4EXVSS2sTURS+50yiJplogzOdvNBNdi6CiojQnY9SHxtRwR+guHDXRTeWoi5dCG4Ltv6GLERc2o1SK9WNUOhGYzPJNBXUCM3MvX5nOtEY0gNn7nl93/3m3ktqxBzHyaeIZgzRHTLmtLQRv0e8GBrzMgiCH8MQGk48x7lGzA+NMSeH64OYiD6w1gvfgqAxqFmDoOi69xXRcwxVBrXRlYlKWqkb+Vxu52ev9076MUHRca5A5hLyAASLWCfgLgi34T3EGUjdQLyM9bgRkmx2DSQb5LquDeYVNOqQ/trvdC5VKpWjZnf3GEVRB2DAM04URc1Wq9XxXLeBTa6CZF0bM5WChMsA1sGuQAKFymo2m9tYxQf2NQkwRDKDkzV1wTKk300KyjC/QBzF+fiPwc5L2HAPAizjek5JhlLfiqK18bh/VchfR/ZLKoJlSEolbatPlEnifRcOw0OQn44HgGUkq5KAmRn/tC8yaWiiaUweiFNgrbxth5B/HYXv8LOHbXuzWCptdrvd/86iVqsdTKfTM5h5As/BFW5vnuTpWkRvIeELbmEFB/QIDfnPua12+5UMep53Hkofw88gxUsnObOPkdZTHL9t5jk0L8J34LdB8kZZ1mcBJ9ZG/Rzi+LzQD7HhA8Hit5Xyfb/BzLMozsNPoLSqtQ6kJ4ZHJPFv2RnWh88KRpKYQIIt33+K9j34TchbBqEjdTHsyKil4J/wbm7htT7b64z5FgqFI2XPu1CtVv9eablczpYmJ6cnYKOQP8GM3/4taKC9AAAAAElFTkSuQmCC", "google": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj4zMjwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgqWsr5jAAACfElEQVQ4EXVTz0tUURT+3o9RZ0YyiSIrpNoESZSYoRmEES5D002Bk1AKZZuC8h+Qglpki2ihLiKERIlq1cIi0yJIEfwBif1QtEVClI7z8713b995k+JYHvju3HPud8797pnzgA2mtd7qum4TMex5XkKglBpi/IKcbaBnu0yqJ2mC2MzGyTm7PstYdXjTdcM07zBgOWMfkXwzAO/bFx5rWHv3I6+6BoHScqE7VNRmWdY9cfwCvK6O+z6kktbKww4kXvRDxVZgBALCgXYcGLl5CF9qRTjSDPI9FmmwbfuZTaeAnHa5KPqAyf2PYYTCCJ5pQE55hV8g/WEY7tfPyCk75vuGYVCA1c7c11KtidDewqD+ee6g/nGyXFOBhLItupTtZ7wIKGVY9t70ZZ3qhY51tawRFXeJtNZxgUOklA/Hy1CY+9ampjLRpZcnYRYCwROHfJmyxFMaLd1JRJMaJrslSLvA+eMBHyxz1NYk+p3kr0XHUJL6rwknxoLLCWApLlkZk6KjsrXyS7DgmniyMMt+ZiyUa6C7OYjeqyH0XAnhQJEJT2kUFZo+gc0cMbl0ivdrRyNuxqtxa3YOfTMvMwSuefwngznA0LSHqXlgW76Bw8VrBToNvmMLee+pvOT2SBd6Pj1F2A7idHEVKncegWmaGF2cwKsJIPW9HpGK7WitkfnQk3xwlf98FqllpD+p0tb9sUe+gqgTQ8CUHsvouQgFbNTuuoi2yjpR5XJyZZCer/YPDFzje+6CQzKyOIWB+XeY+T3HOQH2FezGqT2VqCoqZTntKqVvcJA6/OrrF/lQqGac+L8pJWeidnMjQT7nCIdkkIj9xSDjjYSMfZb9ARmRtLGfbP3kAAAAAElFTkSuQmCC", "yahoo": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAAQoAMABAAAAAEAAAAQAAAAADRVcfIAAAHJaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj40ODwvZXhpZjpQaXhlbFhEaW1lbnNpb24+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj40ODwvZXhpZjpQaXhlbFlEaW1lbnNpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgrZdbzTAAABsUlEQVQ4EYWTOy9EQRTHf3d22SBRsEuEkKyCxGNVEiIaGolQ+AI+g1Yi0fgYOoXGYyMa5RZCIpZ4RSEeQWIRhffaO87suNm99orTzMx//v9zzpwzx5nu1P0hxTIOdVpTYu4XuK6FHQWhMDgOCDdDiPGwUiRFXBsozkEsDtX14kCcf7zAzXFeLBJiuCTDsgkUG4fhcpiYg6Yum8HmAlymBY/k/eFooiog6zw79wnxXmjstOIvOaeTkr48wzOjLTp68M8qqfWM2/ca5GwLrg+kBmV+XqADU7i6VmgbLJB3VyEn+G8LdJDLQvcIRKos/f4cTlO2Jv860NKyyhpIjBao++vw+uR/v3dbkoGJ3jEsrWmxlOw77K3Z/nui4lW+hd9MlT+eITVvU76/gMcrqXYJ0+p8sOl9eaUl3xzB4QZ8vglW4Q9SfPI5cCX9oSkYmLSU7UVYnS2ml+4LNZDoSnrc2lcgNff8/Dq5+8uU/BdrsjH9310B8+tM8XaW7GqGJ8gM7MwkdEYGJeoFMW1saLcDc3siWYWCpIKbgJoHpRVjQsl4UUwXrg/t1P0lznM1dzLmY98XE4KRGYksiAAAAABJRU5ErkJggg=="};
-var PUBLIC_SERVICES=[
-  ["baidu","百度","baidu_ms",50,200],
-  ["youtube","YouTube","ytb_ms",200,500],
-  ["github","GitHub","github_ms",50,200],
-  ["google","Google","google_ms",100,300],
-  ["yahoo","Yahoo","yahoo_hk_ms",50,200],
-];
-function netCard(c){var ns=c.nodes||{};var lk=c.network||{};var l200=lk.link200||{};var lkc=l200.up?'#0f0':'#f44';var lkt=l200.latency?l200.latency.toFixed(2)+'ms':(l200.up===false?'DOWN':'...');
-var htm='<div class="card net-card"><div class="net-top"><div class="net-200g"><span class="net-200g-icon">\u26a1</span><span class="net-200g-label">200G</span><span class="net-200g-nodes">'+esc(l200.link200_nodes||'spark-9051 \u2194 spark-9797')+'</span><span class="net-200g-lat" style="color:'+lkc+'">'+lkt+'</span></div>';
-var tbs=lk.tb||[];tbs.forEach(function(tb){htm+='<div class="net-tb-link">\U0001f5e1 '+esc(tb.from)+' \u2194 '+esc(tb.to)+' <span class="net-tb-speed">'+esc(tb.speed)+'</span></div>';});
-htm+='</div>';
-// Toggle button + legend inline
-htm+='<div class="tog ex" onclick="toggleMatrix(this)"><span class="tog-i">\u25b6</span><span class="tog-t">\u516c\u7f51\u5ef6\u8fdf</span><span class="tog-b">5\u00d75</span><span class="leg"><span class="leg-i"><span class="leg-d" style="background:rgba(34,197,94,.5)"></span>&lt;50ms</span><span class="leg-i"><span class="leg-d" style="background:rgba(234,179,8,.5)"></span>50-200ms</span><span class="leg-i"><span class="leg-d" style="background:rgba(239,68,68,.5)"></span>&gt;200ms</span></span></div>';
-htm+='<div class="net-matrix-wrap open"><div class="pg-grid">';
-// Column headers
-var nn=typeof NODE_NAMES!='undefined'?NODE_NAMES:{};
-htm+='<div></div>';
-for(var si=0;si<PUBLIC_SERVICES.length;si++){
-  var sk=PUBLIC_SERVICES[si];
-  htm+='<div class="ph"><img src="'+LOGOS[sk[0]]+'" alt="'+sk[1]+'" class="pgi"><span class="sn">'+sk[1]+'</span></div>';
-}
-// Location column
-htm+='<div class="ph"><svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 1C5.24 1 3 3.24 3 6c0 3.75 5 9 5 9s5-5.25 5-9c0-2.76-2.24-5-5-5z" fill="#ef4444"/><circle cx="8" cy="6" r="2" fill="#fff"/></svg><span class="sn">\u4f4d\u7f6e</span></div>';
-// Data rows
-var mKeys=Object.keys(ns);
-for(var ri=0;ri<mKeys.length;ri++){
-  var nodeKey=mKeys[ri];var nd=ns[nodeKey];
-  var fn=nn[nodeKey]||(nodeKey.indexOf('.')>=0?nodeKey.split('.')[0]:nodeKey);
-  var sp=fn.indexOf(' ');if(sp>0)fn=fn.substring(0,sp);
-  htm+='<div class="pr">'+esc(fn)+'</div>';
-  var pings=(nd.ping||{});
-  for(var si=0;si<PUBLIC_SERVICES.length;si++){
-    var sk=PUBLIC_SERVICES[si];var val=pings[sk[2]];var g=sk[3];var y=sk[4];
-    if(typeof val==='number'){
-      var c=val<g?'rgba(34,197,94,0.15)':val<y?'rgba(234,179,8,0.15)':'rgba(239,68,68,0.15)';
-      var tc=val<g?'rgba(34,197,94,.9)':val<y?'rgba(234,179,8,.9)':'rgba(239,68,68,.9)';
-      htm+='<div style="background:'+c+';color:'+tc+';font-weight:bold">'+Math.round(val)+'ms</div>';
-    }else{
-      htm+='<div class="na">N/A</div>';
-    }
-  }
-  // Location
-  var loc=pings['public_loc']||'';
-  htm+='<div style="color:#667;font-size:6px">'+esc(loc.slice(0,12))+'</div>';
-}
-htm+='</div></div></div>';return htm;}
-// Toggle public ping matrix
-function toggleMatrix(el){el.classList.toggle('ex');var w=el.nextElementSibling;if(w)w.classList.toggle('open')}
-function switchTheme(t){localStorage.setItem('dltrace-theme',t);document.body.className='theme-'+t;document.querySelectorAll('.theme-btn,.stheme-btn').forEach(function(b){b.classList.toggle('active',b.dataset.theme===t)})}
-function applyTheme(t){switchTheme(t)}
-function navTo(el,id){document.getElementById(id).scrollIntoView({behavior:'smooth'});document.querySelectorAll('.nav-item.active').forEach(function(e){e.classList.remove('active')});el.classList.add('active')}
-(function(){var t=localStorage.getItem('dltrace-theme')||'s360';applyTheme(t)})();
-// Job cards
-function fmtTime(s){if(s==null||s<0)return'--:--:--';var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=Math.floor(s%60);return (h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(ss<10?'0':'')+ss;}
-function jobCard(n){var js=n.jobs||[];var nn=typeof NODE_NAMES!=='undefined'?NODE_NAMES:{};var fn=nn[n.hostname]||(n.hostname||'').split('.')[0];
-if(!js.length)return'';var htm='';
-for(var i=0;i<js.length;i++){var j=js[i];var p=j.pct;var done=j.status==='done'||j.status==='error';var el=j.elapsed_s||0;var rem=j.remaining_s;var barW=done?100:(p!=null?Math.min(100,Math.max(0,p)):(rem!=null&&el>0?Math.min(100,(el/(el+rem))*100):0));
-htm+='<div class="card job-card"><div class="job-header"><span class="job-name" title="'+esc(j.name||j.id)+'">'+(j.type==='content'?'\u{1F3AC} ':'\u{2699} ')+esc(j.name||j.id)+'</span><span class="job-type '+(j.type||'content')+'">'+(j.type==='content'?'\u5185\u5BB9\u751F\u4EA7':j.type==='code'?'\u4EE3\u7801\u7F16\u8BD1':'')+'</span></div><div class="job-progress"><div class="job-progress-fill'+(done?' job-done':'')+'" style="width:'+barW+'%"></div></div><div class="job-timers"><span>\u23F1 '+fmtTime(el)+'</span>'+(rem!=null?'<span class="job-eta">\u23F3 '+fmtTime(rem)+'</span>':'')+'<span>'+(done?((j.status==='done'?'\u2705 \u5DF2\u5B8C\u6210':'\u274C \u9519\u8BEF')):(p!=null?Math.round(p)+'%':'...'))+'</span></div>';
-if(j.detail)htm+='<div class="job-detail">'+esc(j.detail)+'</div>';
-if(j.auto&&fn)htm+='<div class="job-node">\u{1F4BB} '+esc(fn)+'</div>';
-htm+='</div>';}
-return htm;}
-// Job render collector
-var _jobHtml='';
-function collectJobCards(d){var ns=d.nodes||{};var htm='';var keys=Object.keys(ns);var any=false;
-for(var i=0;i<keys.length;i++){var h=keys[i];var n=ns[h];var jc=jobCard(n);if(jc){htm+=jc;any=true;}}
-if(!any)htm='<div class="job-empty"><div class="icon">\u{1F4AD}</div><p>\u65E0\u6D3B\u8DC3\u4EFB\u52A1</p><p style="font-size:8px;margin-top:4px">\u5199\u5165 /tmp/dltrace_jobs.json \u4EE5\u624B\u52A8\u58F0\u660E\u4EFB\u52A1</p></div>';
-_jobHtml=htm;return htm;}
-// Docker
-function dockerCard(d){var ns=d.nodes||{};var keys=Object.keys(ns);var htm='';for(var i=0;i<keys.length;i++){var h=keys[i];var n=ns[h];var dc=n.docker||n.containers;if(!dc)continue;if(typeof dc==='object'&&!Array.isArray(dc)&&dc.containers){dc=dc.containers}if(!Array.isArray(dc)||!dc.length)continue;var fn=NODE_NAMES[h]||h.split('.')[0];var run=dc.filter(function(c){return c.state==='running'}).length;var stop=dc.length-run;var summary=(run?run+' running':'')+(run&&stop?', ':'')+(stop?stop+' stopped':'')||'n/a';
-htm+='<div class="card dl-card" style="padding:8px"><div class="card-header"><span class="card-title online"><span class="status-dot online"></span>'+esc(fn)+'</span><span style="font-size:8px;color:#448">'+summary+'</span></div><div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:3px">';
-for(var j=0;j<dc.length;j++){var c=dc[j];var ctx=c.state==='running'?'#0f0;text-shadow:0 0 4px #0f0':'#f44;text-shadow:0 0 4px #f44';var ctn=c.state==='running'?'#1a1a1a':'#080812';htm+='<div style="background:'+ctn+';border:1px solid rgba(255,255,255,0.04);border-radius:3px;padding:3px 6px;font-size:8px"><span style="color:'+ctx+'" title="'+esc(c.state)+'">\u25CF</span> '+esc(c.name||c.id||'').substring(0,25)+(c.image?' <span style="color:#445">'+esc(c.image).substring(0,20)+'</span>':'')+'</div>';}
-htm+='</div></div>';}
-return htm||'<div class="empty-state"><p style="text-align:center;color:#334;font-size:10px">No Docker data</p></div>';}
-// Disk I/O
-function diskCard(d){var ns=d.nodes||{};var keys=Object.keys(ns);var htm='';for(var i=0;i<keys.length;i++){var h=keys[i];var n=ns[h];var io=n.diskio;if(!io||!Array.isArray(io)||!io.length)continue;var fn=NODE_NAMES[h]||h.split('.')[0];var totR=0,totW=0;
-for(var k=0;k<io.length;k++){totR+=io[k].kb_read||0;totW+=io[k].kb_write||0;}
-htm+='<div class="card dl-card" style="padding:8px"><div class="card-header"><span class="card-title online"><span class="status-dot online"></span>'+esc(fn)+'</span><span style="font-size:8px;color:#448">\u2191 '+fmtKb(totR)+'  \u2193 '+fmtKb(totW)+'</span></div><table style="width:100%;margin-top:4px;border-collapse:collapse;font-size:8px"><tr style="color:#556"><td style="padding:2px 4px">Device</td><td style="padding:2px 4px">Activity</td><td style="padding:2px 4px;text-align:right">R/W</td></tr>';
-for(var k=0;k<io.length;k++){var dk=io[k];var r=dk.kb_read||0;var w=dk.kb_write||0;var mx=Math.max(1,totR,totW);var rp=r/mx*100;var wp=w/mx*100;
-htm+='<tr><td style="padding:1px 4px;color:#aab;white-space:nowrap">'+esc(dk.device||'')+'</td>'
-+'<td style="padding:1px 4px"><div style="display:flex;height:8px;border-radius:4px;overflow:hidden;width:50px;background:#1a1e2e">'
-+'<div style="width:'+rp+'%;background:#2e6;min-width:1px"></div>'
-+'<div style="width:'+wp+'%;background:#48f;min-width:1px"></div>'
-+'</div></td>'
-+'<td style="padding:1px 4px;text-align:right;white-space:nowrap;color:#889">R'+fmtKb(r)+'&nbsp;W'+fmtKb(w)+'</td></tr>';}
-htm+='</table></div>';}
-return htm||'<div class="empty-state"><p style="text-align:center;color:#334;font-size:10px">No disk I/O data</p></div>';}
-// --- end docker+disk ---
-// BG particles
-(function(){var cv=document.getElementById("bg");if(!cv)return;var c=cv.getContext("2d");var pts=[];
-function rs(){cv.width=window.innerWidth;cv.height=window.innerHeight}rs();window.addEventListener("resize",rs);
-for(var i=0;i<60;i++)pts.push({x:Math.random()*cv.width,y:Math.random()*cv.height,vx:(Math.random()-.5)*.3,vy:(Math.random()-.5)*.3,r:Math.random()*1.2+.3});
-(function d(){c.clearRect(0,0,cv.width,cv.height);c.strokeStyle="#0ff1";c.lineWidth=.5;
-for(var i=0;i<pts.length;i++)for(var j=i+1;j<pts.length;j++){var p=pts[i],q=pts[j],dx=p.x-q.x,dy=p.y-q.y;if(dx*dx+dy*dy<8e3){c.beginPath();c.moveTo(p.x,p.y);c.lineTo(q.x,q.y);c.stroke()}}
-for(var p of pts){p.x+=p.vx;p.y+=p.vy;if(p.x<0||p.x>cv.width)p.vx*=-1;if(p.y<0||p.y>cv.height)p.vy*=-1;c.fillStyle="#0ff";c.beginPath();c.arc(p.x,p.y,p.r,0,6.28);c.fill()}requestAnimationFrame(d)})();})();
-var NODE_NAMES={{NODE_NAMES_JSON}}
-var NODE_KEYS={{NODE_KEYS_JSON}}
-var FIXED_NAME={{FIXED_NAMES_JSON}}
-function render(d){var ns=d.nodes||{};var gt=d.gpu_trends||{};
-var sys='';for(var i=0;i<NODE_KEYS.length;i++){var k=NODE_KEYS[i];var n=ns[k];var gtKey=gt[k];if(gtKey&&n){n.gpu_trends={};n.gpu_trends[k]=gtKey;}sys+=sysCard(k,n);}$('sys-grid').innerHTML=sys;
-$('net-section').innerHTML=netCard(d);
-var dl='';for(var i=0;i<keys.length;i++)dl+=dlCard(keys[i],ns[keys[i]]);$('dl-grid').innerHTML=dl;
-var jb=collectJobCards(d);$('job-grid').innerHTML=jb;
-var dc=dockerCard(d);$('docker-grid').innerHTML=dc;
-var dk=diskCard(d);$('diskio-grid').innerHTML=dk;
-var total=0;for(var k in ns)total+=ns[k].tracked_total||0;
-var sb=document.querySelector('.topbar > span:last-child');if(sb)sb.innerHTML='<span class="status-dot online"></span> '+keys.length+' nodes \u00B7 '+total+' files  <span style="margin-left:8px;color:#224">5s \u00B7 auto</span>';
-var mr=document.querySelector('meta[http-equiv="refresh"]');if(mr)mr.parentNode.removeChild(mr);}
-
-(function(){var t=localStorage.getItem('dltrace-theme');if(t)switchTheme(t);})();
-try{render({{DATA}});}catch(e){}
-(function poll(){setTimeout(function(){fetch('/api/v1/metrics').then(function(r){return r.json()}).then(function(d){render(d);poll();}).catch(function(){setTimeout(poll,POLL);});},POLL);})();
-setInterval(function(){var on=document.querySelectorAll('.status-dot.online').length;var tot=document.querySelectorAll('.sys-card').length||on;document.title=(on===tot?'\uD83D\uDFE2':'\uD83D\uDD34')+on+'/'+tot+' | K38';},3000);
-
-function renderAlerts(data){var b=$('alert-banner'),c=$('alert-count'),i=$('alert-items');if(!b||!c||!i)return;var alerts=data&&data.alerts?data.alerts:[];if(!alerts||alerts.length===0){b.classList.remove('visible');return;}
-c.textContent=alerts.length;var maxSev='warning';var items='';for(var ai=0;ai<Math.min(alerts.length,6);ai++){var a=alerts[ai];if(a.severity==='critical')maxSev='critical';items+='<span class="alert-item"><span class="alert-sev '+a.severity+'">'+a.severity+'</span>'+esc(a.metric)+'='+esc(a.value)+(a.node?' @'+esc(a.node):'')+'</span>';}
-b.className='alert-banner visible '+maxSev;i.innerHTML=items;}
-
-try{renderAlerts({{DATA}});}catch(e){}
-
-// Patch poll to also call renderAlerts
-var _origPoll=poll;poll=function(){_origPoll();setTimeout(function(){try{fetch('/api/v1/metrics').then(function(r){return r.json()}).then(function(d){renderAlerts(d);});}catch(e){}},500);};
-</script></body></html>"""
+var editMode=false,editPanel=document.getElementById('edit-panel'),editArea=document.getElementById('edit-area'),editRes=document.getElementById('edit-res'),editBtn=document.getElementById('edit-btn');
+var app=document.getElementById('app');
+function toggleEdit(){editMode=!editMode;if(editMode){editPanel.style.display='flex';document.body.classList.add('edit-mode');editBtn.textContent='✕';try{var ss='';for(var i=0;i<document.styleSheets.length;i++){try{var r=document.styleSheets[i].cssRules||document.styleSheets[i].rules;if(r)for(var j=0;j<r.length;j++)ss+=r[j].cssText+'\n'}catch(e){}}editArea.value=ss}catch(e){editArea.value='/* CSS load error */'}}else{editPanel.style.display='none';document.body.classList.remove('edit-mode');editBtn.textContent='EDIT'}}
+function applyEdit(){var css=editArea.value;var s=document.createElement('style');s.textContent=css;document.head.appendChild(s);editRes.textContent='✔ 已应用 ('+css.length+'b)';editRes.className='res ok';setTimeout(function(){editRes.textContent='Ctrl+Enter 应用';editRes.className='res'},3000)}
+editArea.addEventListener('keydown',function(e){if(e.ctrlKey&&e.key==='Enter'){applyEdit()}});
+</script>
+</body></html>"""
 
 
 # ════════════════════════════════════════════
