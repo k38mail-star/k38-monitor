@@ -1,0 +1,166 @@
+{
+  "test": "K38 DLT v0.3 暴力测试",
+  "timestamp": "2026-06-13T16:50:23Z",
+  "version": "v0.5.0",
+  "total": 26,
+  "pass": 25,
+  "fail": 1,
+  "results": [
+    {
+      "level": "L0",
+      "name": "Daemon AST解析",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L0",
+      "name": "Node.js语法",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L0",
+      "name": "Daemon进程存活",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L0",
+      "name": "ECS HTTP 200",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L0",
+      "name": "API latest非空",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L0",
+      "name": "WebSocket推流",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L1",
+      "name": "API JSON全字段校验",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L1",
+      "name": "Web路由完整性",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L1",
+      "name": "页面含版本号",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L1",
+      "name": "页面大小达标",
+      "status": "PASS",
+      "detail": "20723 B"
+    },
+    {
+      "level": "L1",
+      "name": "历史数据合理",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L2",
+      "name": "高频轮询30次",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L2",
+      "name": "50并发×5轮",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L3",
+      "name": "Redis缓存",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L3",
+      "name": "PG历史存储",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L3",
+      "name": "Ingest API",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L3",
+      "name": "面板趋势图按钮",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L3",
+      "name": "面板高速互联",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L3",
+      "name": "面板延迟显示",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L4",
+      "name": "本机ECS致性",
+      "status": "FAIL",
+      "detail": "3vs1"
+    },
+    {
+      "level": "L4",
+      "name": "Daemon持续运行",
+      "status": "PASS",
+      "detail": "10:48PM"
+    },
+    {
+      "level": "L7",
+      "name": "100并发latest",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L7",
+      "name": "50并发history",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L7",
+      "name": "大负载Ingest",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L8",
+      "name": "数据盾严格校验",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "level": "L8",
+      "name": "历史数据单调递增",
+      "status": "PASS",
+      "detail": ""
+    }
+  ]
+}
