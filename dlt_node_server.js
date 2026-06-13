@@ -22,7 +22,7 @@ const PG_HOST = process.env.PG_HOST || '127.0.0.1';
 const PG_PORT = parseInt(process.env.PG_PORT || '5432');
 const PG_DB = process.env.PG_DB || 'dltrace';
 const PG_USER = process.env.PG_USER || 'medusa';
-const PG_PASS = process.env.PG_PASS || 'k38admin';
+const PG_PASS = process.env.PG_PASS || '';
 
 // === Redis & PostgreSQL ===
 const redis = new Redis({ host: REDIS_HOST, port: 6379, retryStrategy: t => Math.min(t * 100, 3000), maxRetriesPerRequest: 1 });
