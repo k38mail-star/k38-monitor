@@ -18,6 +18,7 @@ import argparse
 import glob
 import json
 import os
+import sys
 import re
 import subprocess
 import sys
@@ -100,8 +101,9 @@ def _get_pg():
     if _PG is None:
         try:
             import psycopg2
+            _password = os.environ.get('DLTRACE_PGPASS') or open(os.path.expanduser('~/.dltrace_pgpass')).read().strip()
             _PG = psycopg2.connect(host='100.93.251.118', port=5432, dbname='dltrace',
-                                   user='medusa', password=os.environ.get('DLTRACE_PGPASS', ''), connect_timeout=2)
+                                   user='medusa', password=_password, connect_timeout=2)
         except Exception:
             _PG = None
     return _PG
