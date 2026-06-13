@@ -175,7 +175,7 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 # 配置常量
 # ════════════════════════════════════════════
 
-__version__ = "0.5.3"
+__version__ = "0.5.5"
 
 # Web Authentication
 DLTRACE_TOKEN = os.environ.get("DLTRACE_TOKEN", "")
