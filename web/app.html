@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>dltrace · K38 集群监控</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --teal: #56d4dd;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 16px;
+    min-height: 100vh;
+  }
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px; margin-bottom: 16px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  }
+  .header h1 { font-size: 20px; font-weight: 600; color: var(--accent); }
+  .header .status-badge { font-size: 12px; padding: 4px 10px; border-radius: 12px; }
+  .status-badge.online { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid var(--green); }
+  .status-badge.offline { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid var(--red); }
+  .status-badge.warning { background: rgba(210,153,34,0.15); color: var(--yellow); border: 1px solid var(--yellow); }
+  .status-badge.loading { background: rgba(88,166,255,0.1); color: var(--accent); border: 1px solid var(--accent); }
+  .header-ts { font-size: 12px; color: var(--text-dim); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px;
+  }
+  .card h3 { font-size: 13px; color: var(--text-dim); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .card .value { font-size: 28px; font-weight: 700; }
+  .card .sub { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+  .card .bar-container { margin-top: 6px; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
+  .card .bar { height: 100%; border-radius: 3px; transition: width 0.5s ease; }
+  .bar.green { background: var(--green); }
+  .bar.yellow { background: var(--yellow); }
+  .bar.red { background: var(--red); }
+  .bar.blue { background: var(--accent); }
+  .bar.purple { background: var(--purple); }
+  .bar.teal { background: var(--teal); }
+
+  .nodes-section { margin-bottom: 16px; }
+  .nodes-section h2 { font-size: 15px; margin-bottom: 10px; color: var(--text); }
+  .node-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+  .node-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+  }
+  .node-card .node-name { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+  .node-card .node-name .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.online { background: var(--green); }
+  .dot.offline { background: var(--red); }
+  .dot.unknown { background: var(--text-dim); }
+  .node-card .metric-row { display: flex; justify-content: space-between; font-size: 12px; padding: 2px 0; }
+  .node-card .metric-row .label { color: var(--text-dim); }
+  .node-card .metric-row .val { font-weight: 500; }
+
+  .chart-section { margin-bottom: 16px; }
+  .chart-section h2 { font-size: 15px; margin-bottom: 10px; }
+  .chart-container { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  canvas { width: 100% !important; height: 180px !important; }
+
+  .gpu-trend-section { margin-bottom: 16px; }
+  .gpu-trend-section h2 { font-size: 15px; margin-bottom: 10px; }
+
+  .footer { text-align: center; padding: 20px 0; font-size: 12px; color: var(--text-dim); }
+  .error-msg { color: var(--red); padding: 20px; text-align: center; }
+
+  .loading-text { color: var(--text-dim); text-align: center; padding: 40px; }
+  .loading-text .spinner { display: inline-block; width: 20px; height: 20px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 8px; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  @media (max-width: 600px) {
+    body { padding: 8px; }
+    .grid { grid-template-columns: repeat(2, 1fr); }
+    .node-grid { grid-template-columns: 1fr; }
+    .card .value { font-size: 22px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header" id="header">
+  <div>
+    <h1>⬡ dltrace · K38 集群</h1>
+    <div class="header-ts" id="headerTs">加载中...</div>
+  </div>
+  <div>
+    <span class="status-badge loading" id="statusBadge">⏳ 连接中</span>
+  </div>
+</div>
+
+<!-- Loading State -->
+<div id="loadingState" class="loading-text">
+  <span class="spinner"></span> 正在采集集群数据...
+</div>
+<div id="errorState" class="error-msg" style="display:none;"></div>
+<div id="dashboard" style="display:none;">
+
+<!-- System Metrics Grid -->
+<div class="grid" id="metricsGrid">
+  <div class="card" id="cpuCard">
+    <h3>CPU</h3>
+    <div class="value" id="cpuValue">-</div>
+    <div class="bar-container"><div class="bar blue" id="cpuBar" style="width:0%"></div></div>
+    <div class="sub" id="cpuSub">-</div>
+  </div>
+  <div class="card" id="memCard">
+    <h3>内存</h3>
+    <div class="value" id="memValue">-</div>
+    <div class="bar-container"><div class="bar purple" id="memBar" style="width:0%"></div></div>
+    <div class="sub" id="memSub">-</div>
+  </div>
+  <div class="card" id="gpuCard">
+    <h3>GPU</h3>
+    <div class="value" id="gpuValue">-</div>
+    <div class="bar-container"><div class="bar green" id="gpuBar" style="width:0%"></div></div>
+    <div class="sub" id="gpuSub">-</div>
+  </div>
+  <div class="card" id="diskCard">
+    <h3>磁盘</h3>
+    <div class="value" id="diskValue">-</div>
+    <div class="bar-container"><div class="bar yellow" id="diskBar" style="width:0%"></div></div>
+    <div class="sub" id="diskSub">-</div>
+  </div>
+  <div class="card" id="tempCard">
+    <h3>GPU 温度</h3>
+    <div class="value" id="tempValue">-</div>
+    <div class="sub" id="tempSub">-</div>
+  </div>
+  <div class="card" id="uptimeCard">
+    <h3>运行时长</h3>
+    <div class="value" id="uptimeValue" style="font-size:18px;">-</div>
+    <div class="sub" id="uptimeSub">本机</div>
+  </div>
+</div>
+
+<!-- Node List -->
+<div class="nodes-section">
+  <h2>🖥️ 节点状态</h2>
+  <div class="node-grid" id="nodeGrid"></div>
+</div>
+
+<!-- Timeline Chart -->
+<div class="chart-section">
+  <h2>📈 时间线</h2>
+  <div class="chart-container">
+    <canvas id="timelineChart"></canvas>
+  </div>
+</div>
+
+<!-- GPU Trend -->
+<div class="gpu-trend-section" id="gpuTrendSection">
+  <h2>🔥 GPU 趋势 (最近 12 个采样)</h2>
+  <div class="chart-container">
+    <canvas id="gpuTrendChart"></canvas>
+  </div>
+</div>
+
+</div><!-- /dashboard -->
+
+<div class="footer">
+  dltrace · K38 Infrastructure Monitoring · 自动刷新每 5 秒
+</div>
+
+<script>
+// ── API Base ──────────────────────────────────────────────────
+const API_BASE = '';  // empty = relative (proxy or same-origin)
+
+async function apiFetch(path) {
+  const resp = await fetch(API_BASE + path);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+  return resp.json();
+}
+
+// ── Utility ───────────────────────────────────────────────────
+function fmtPct(v) {
+  if (v == null) return '-';
+  return parseFloat(v).toFixed(1) + '%';
+}
+
+function fmtGb(v) {
+  if (v == null) return '-';
+  return parseFloat(v).toFixed(1) + ' GB';
+}
+
+function fmtTemp(v) {
+  if (v == null) return '-°C';
+  return parseFloat(v).toFixed(0) + '°C';
+}
+
+function barColor(pct) {
+  if (pct == null) return 'blue';
+  if (pct > 90) return 'red';
+  if (pct > 70) return 'yellow';
+  return 'blue';
+}
+
+function uptimeStr(v) {
+  if (v == null) return '-';
+  const s = String(v);
+  if (s.includes(':')) return s;  // already formatted hh:mm:ss
+  if (s.includes('day') || s.includes('up')) return s;
+  const sec = parseInt(s, 10);
+  if (isNaN(sec)) return s;
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  return d > 0 ? `${d}d ${h}h` : `${h}h`;
+}
+
+function nodeDot(status) {
+  if (status === 'online') return 'online';
+  if (status === 'offline') return 'offline';
+  return 'unknown';
+}
+
+// ── Render Functions ──────────────────────────────────────────
+
+function renderMetrics(system) {
+  const cpu = system.cpu_pct;
+  const mem = system.mem_pct;
+  const gpu = system.gpu_pct;
+  const disk = system.disk_pct;
+  const gpuTemp = system.gpu_temp;
+
+  document.getElementById('cpuValue').textContent = fmtPct(cpu);
+  document.getElementById('cpuBar').style.width = (cpu ?? 0) + '%';
+  document.getElementById('cpuBar').className = 'bar ' + barColor(cpu);
+  document.getElementById('cpuSub').textContent = 'CPU ' + (system.cpu_temp != null ? fmtTemp(system.cpu_temp) : '');
+
+  document.getElementById('memValue').textContent = fmtGb(system.mem_used_gb) + ' / ' + fmtGb(system.mem_total_gb);
+  document.getElementById('memBar').style.width = (mem ?? 0) + '%';
+  document.getElementById('memBar').className = 'bar ' + barColor(mem);
+  document.getElementById('memSub').textContent = fmtPct(mem) + ' 使用率';
+
+  document.getElementById('gpuValue').textContent = fmtPct(gpu);
+  document.getElementById('gpuBar').style.width = (gpu ?? 0) + '%';
+  document.getElementById('gpuBar').className = 'bar ' + barColor(gpu);
+  const gpuInfo = system.gpu_info || '';
+  document.getElementById('gpuSub').textContent = gpuInfo + (system.gpu_power != null ? ` ${system.gpu_power}W` : '');
+
+  document.getElementById('diskValue').textContent = fmtPct(disk);
+  document.getElementById('diskBar').style.width = (disk ?? 0) + '%';
+  document.getElementById('diskBar').className = 'bar ' + barColor(disk);
+  document.getElementById('diskSub').textContent = (system.disk_used || '-') + ' / ' + (system.disk_total || '-');
+
+  document.getElementById('tempValue').textContent = fmtTemp(gpuTemp);
+  document.getElementById('tempSub').textContent = gpuTemp != null ? (gpuTemp > 75 ? '⚠️ 偏高' : '正常') : '';
+
+  const up = uptimeStr(system.uptime);
+  document.getElementById('uptimeValue').textContent = up || '-';
+  document.getElementById('uptimeSub').textContent = system.gpu_vram ? `VRAM: ${system.gpu_vram}` : '';
+}
+
+function renderNodes(nodesData) {
+  const grid = document.getElementById('nodeGrid');
+  grid.innerHTML = '';
+
+  if (!nodesData.nodes || nodesData.nodes.length === 0) {
+    grid.innerHTML = '<div class="node-card"><div class="node-name">暂无节点数据</div></div>';
+    return;
+  }
+
+  for (const node of nodesData.nodes) {
+    const card = document.createElement('div');
+    card.className = 'node-card';
+    card.innerHTML = `
+      <div class="node-name">
+        <span class="dot ${nodeDot(node.status)}"></span>
+        ${node.name}
+        ${node.local ? '<span style="font-size:11px;color:var(--text-dim);margin-left:6px;">(本机)</span>' : ''}
+      </div>
+      <div class="metric-row"><span class="label">状态</span><span class="val">${node.status}</span></div>
+      <div class="metric-row"><span class="label">CPU</span><span class="val">${fmtPct(node.cpu_pct)}</span></div>
+      <div class="metric-row"><span class="label">内存</span><span class="val">${fmtPct(node.mem_pct)}</span></div>
+      <div class="metric-row"><span class="label">GPU</span><span class="val">${fmtPct(node.gpu_pct)}</span></div>
+      <div class="metric-row"><span class="label">GPU 温度</span><span class="val">${fmtTemp(node.gpu_temp)}</span></div>
+      <div class="metric-row"><span class="label">磁盘</span><span class="val">${fmtPct(node.disk_pct)}</span></div>
+      <div class="metric-row"><span class="label">运行时长</span><span class="val">${uptimeStr(node.uptime)}</span></div>
+    `;
+    grid.appendChild(card);
+  }
+}
+
+function renderTimeline(history) {
+  const canvas = document.getElementById('timelineChart');
+  if (!history || Object.keys(history).length === 0) {
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+
+  // Pick the series with the most points
+  let bestSeries = 'cpu';
+  let bestLen = 0;
+  for (const [key, points] of Object.entries(history)) {
+    if (Array.isArray(points) && points.length > bestLen) {
+      bestLen = points.length;
+      bestSeries = key;
+    }
+  }
+
+  const labels = [];
+  const datasets = [];
+  const colors = { cpu: '#58a6ff', mem: '#bc8cff', gpu: '#3fb950', gpu_temp: '#f85149', cpu_temp: '#d29922', load: '#56d4dd' };
+  const seriesKeys = ['cpu', 'mem', 'gpu', 'gpu_temp', 'load'];
+
+  for (const key of seriesKeys) {
+    const points = history[key];
+    if (!Array.isArray(points) || points.length < 2) continue;
+    if (key !== bestSeries && points.length < 3) continue;
+
+    const values = points.map(p => parseFloat(p[1]));
+    // Only show first point's time label
+    if (datasets.length === 0) {
+      const base = points[0][0];
+      for (let i = 0; i < points.length; i++) {
+        const dt = Math.round((points[i][0] - base) / 60);
+        labels.push(dt + 'm');
+      }
+    }
+    datasets.push({
+      label: key,
+      data: values,
+      color: colors[key] || '#58a6ff',
+    });
+  }
+
+  drawCanvasChart(canvas, labels, datasets);
+}
+
+function renderGpuTrend(gpuTrends) {
+  const canvas = document.getElementById('gpuTrendChart');
+  if (!gpuTrends || Object.keys(gpuTrends).length === 0) {
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    document.getElementById('gpuTrendSection').style.display = 'none';
+    return;
+  }
+  document.getElementById('gpuTrendSection').style.display = '';
+
+  const labels = [];
+  const tempDatasets = [];
+  const powerDatasets = [];
+
+  for (const [node, samples] of Object.entries(gpuTrends)) {
+    if (!Array.isArray(samples) || samples.length < 2) continue;
+    const temps = samples.map((s, i) => {
+      if (labels.length < samples.length) labels.push(String(i));
+      return s.temp;
+    });
+    const powers = samples.map(s => s.power);
+    tempDatasets.push({ label: node + ' temp', data: temps, color: '#f85149' });
+    powerDatasets.push({ label: node + ' power', data: powers, color: '#d29922' });
+  }
+
+  if (tempDatasets.length > 0) {
+    drawCanvasChart(canvas, labels, tempDatasets);
+  }
+}
+
+// ── Simple Canvas Chart ───────────────────────────────────────
+function drawCanvasChart(canvas, labels, datasets) {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const w = rect.width - 20;
+  const h = 180;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  if (!labels || labels.length === 0 || !datasets || datasets.length === 0) return;
+
+  // Find bounds
+  let minY = Infinity, maxY = -Infinity;
+  for (const ds of datasets) {
+    for (const v of ds.data) {
+      if (v < minY) minY = v;
+      if (v > maxY) maxY = v;
+    }
+  }
+  const range = maxY - minY || 1;
+  const padY = range * 0.1;
+  minY -= padY;
+  maxY += padY;
+
+  const margin = { top: 10, right: 10, bottom: 25, left: 40 };
+  const chartW = w - margin.left - margin.right;
+  const chartH = h - margin.top - margin.bottom;
+
+  // Grid lines
+  ctx.strokeStyle = '#21262d';
+  ctx.lineWidth = 1;
+  const gridLines = 4;
+  for (let i = 0; i <= gridLines; i++) {
+    const y = margin.top + (chartH / gridLines) * i;
+    ctx.beginPath();
+    ctx.moveTo(margin.left, y);
+    ctx.lineTo(w - margin.right, y);
+    ctx.stroke();
+  }
+
+  // Draw each dataset
+  for (const ds of datasets) {
+    const pts = ds.data;
+    if (pts.length < 2) continue;
+
+    const stepX = chartW / Math.max(pts.length - 1, 1);
+    ctx.strokeStyle = ds.color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < pts.length; i++) {
+      const x = margin.left + i * stepX;
+      const y = margin.top + chartH - ((pts[i] - minY) / range) * chartH;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Label at end
+    const lastX = margin.left + (pts.length - 1) * stepX;
+    const lastY = margin.top + chartH - ((pts[pts.length - 1] - minY) / range) * chartH;
+    ctx.fillStyle = ds.color;
+    ctx.font = '10px -apple-system, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(ds.label, lastX + 4, lastY + 3);
+  }
+
+  // X labels
+  ctx.fillStyle = '#8b949e';
+  ctx.font = '10px -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+  const labelStep = Math.max(1, Math.floor(labels.length / 6));
+  for (let i = 0; i < labels.length; i += labelStep) {
+    const x = margin.left + (i / Math.max(labels.length - 1, 1)) * chartW;
+    ctx.fillText(labels[i], x, h - 5);
+  }
+
+  // Y labels
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= gridLines; i++) {
+    const val = maxY - (range / gridLines) * i;
+    const y = margin.top + (chartH / gridLines) * i;
+    ctx.fillText(val.toFixed(0), margin.left - 5, y + 3);
+  }
+}
+
+// ── Main Update Loop ──────────────────────────────────────────
+async function updateDashboard() {
+  try {
+    const [systemData, nodesData, historyData] = await Promise.all([
+      apiFetch('/api/system'),
+      apiFetch('/api/nodes'),
+      apiFetch('/api/history'),
+    ]);
+
+    document.getElementById('dashboard').style.display = '';
+    document.getElementById('loadingState').style.display = 'none';
+    document.getElementById('errorState').style.display = 'none';
+
+    // Header
+    const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    document.getElementById('headerTs').textContent = '更新于 ' + ts;
+    const badge = document.getElementById('statusBadge');
+    badge.textContent = '✅ 在线';
+    badge.className = 'status-badge online';
+
+    renderMetrics(systemData);
+    renderNodes(nodesData);
+    renderTimeline(historyData.history);
+    renderGpuTrend(historyData.gpu_trends);
+  } catch (err) {
+    console.error('Dashboard update error:', err);
+    document.getElementById('loadingState').style.display = 'none';
+    document.getElementById('dashboard').style.display = 'none';
+    const errEl = document.getElementById('errorState');
+    errEl.style.display = '';
+    errEl.innerHTML = `⚠️ 无法连接到监测服务: ${err.message}<br><br>
+      <button onclick="location.reload()" style="
+        background:var(--accent); color:var(--bg); border:none; border-radius:6px;
+        padding:8px 20px; font-size:14px; cursor:pointer;">重新连接</button>`;
+
+    const badge = document.getElementById('statusBadge');
+    badge.textContent = '❌ 离线';
+    badge.className = 'status-badge offline';
+  }
+}
+
+// ── Init ──────────────────────────────────────────────────────
+updateDashboard();
+setInterval(updateDashboard, 5000);
+</script>
+</body>
+</html>
