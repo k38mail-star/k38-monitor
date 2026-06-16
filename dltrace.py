@@ -24,6 +24,11 @@ import subprocess
 import sys
 import threading
 import time
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -175,7 +180,7 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 # 配置常量
 # ════════════════════════════════════════════
 
-__version__ = "0.5.5"
+__version__ = "0.5.6"
 
 # Web Authentication
 DLTRACE_TOKEN = os.environ.get("DLTRACE_TOKEN", "")
@@ -948,6 +953,18 @@ class DownloadTracker:
             except (OSError, subprocess.TimeoutExpired, ValueError):
                 pass
 
+            # 运行时间(秒)
+            try:
+                if _HAS_PSUTIL:
+                    boot = psutil.boot_time()
+                    info["uptime"] = round(time.time() - boot)
+                else:
+                    out = subprocess.check_output(["sysctl", "-n", "kern.boottime"], timeout=3, text=True)
+                    m = re.search(r'sec = (\d+)', out)
+                    if m: info["uptime"] = round(time.time() - int(m.group(1)))
+            except Exception:
+                pass
+
             # GPU
             try:
                 gpu = subprocess.check_output(
@@ -1081,15 +1098,24 @@ class DownloadTracker:
                         info["disk_used"] = parts[2]
                         info["disk_pct"] = float(parts[4].rstrip("%"))
             except (OSError, subprocess.TimeoutExpired, ValueError): pass
-            # 运行时间
+            # 运行时间(秒 + 文本)
             try:
-                out = subprocess.check_output(["uptime"], timeout=3, text=True)
-                info["uptime_raw"] = out.strip()
-                m = re.search(r'up\s+([^,]+)', out)
-                if m: info["uptime"] = m.group(1).strip()
-                m2 = re.search(r'load\s+average[s]?\s*:\s*([\d.]+)', out)
-                if m2: info["load"] = m2.group(1)
-            except (OSError, subprocess.TimeoutExpired, ValueError): pass
+                if _HAS_PSUTIL:
+                    boot = psutil.boot_time()
+                    info["uptime"] = round(time.time() - boot)
+                else:
+                    with open('/proc/uptime') as f:
+                        up = f.read().strip().split()
+                        if up: info["uptime"] = round(float(up[0]))
+            except Exception:
+                try:
+                    out = subprocess.check_output(["uptime"], timeout=3, text=True)
+                    info["uptime_raw"] = out.strip()
+                    m = re.search(r'up\s+([^,]+)', out)
+                    if m: info["uptime"] = m.group(1).strip()
+                    m2 = re.search(r'load\s+average[s]?\s*:\s*([\d.]+)', out)
+                    if m2: info["load"] = m2.group(1)
+                except (OSError, subprocess.TimeoutExpired, ValueError): pass
 
         return info
 
@@ -1326,7 +1352,7 @@ class DownloadTracker:
             hardcoded={
                 "三万八":    "http://192.168.3.29:8899/api/v1/metrics",
                 "小四":      "http://192.168.3.46:8899/api/v1/metrics",
-                "大傻":      "jager-dgx@10.0.0.126",
+                "大傻":      "jager-dgx@192.168.3.55",
                 "二傻":      "jager-dgx-2@192.168.3.45",
             }
         )
@@ -1656,21 +1682,24 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                 self.wfile.write(b"OK")
                 return
             data = self._read_data()
-            # Redis缓存 + PostgreSQL历史
-            try:
-                r = _get_redis()
-                if r:
-                    r.setex('dlt:latest', 300, json.dumps(data, default=str))
-                pg = _get_pg()
-                if pg:
-                    cur = pg.cursor()
-                    cur.execute('INSERT INTO dlt_snapshots (data) VALUES (%s)', (json.dumps(data, default=str),))
-                    pg.commit()
-                    cur.close()
-            except Exception:
-                pass
+            # Redis缓存 + PostgreSQL历史 (后台线程, 失败不阻塞)
+            def _save_to_remote(d):
+                try:
+                    r = _get_redis()
+                    if r:
+                        r.setex('dlt:latest', 300, json.dumps(d, default=str), socket_timeout=2)
+                    pg = _get_pg()
+                    if pg:
+                        cur = pg.cursor()
+                        cur.execute('INSERT INTO dlt_snapshots (data) VALUES (%s)', (json.dumps(d, default=str),))
+                        pg.commit()
+                        cur.close()
+                except Exception:
+                    pass
+            threading.Thread(target=_save_to_remote, args=(data,), daemon=True).start()
             if path == "/api/v1/metrics":
                 self.send_response(200)
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
@@ -1678,6 +1707,7 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
             elif path == "/api/v1/json":
                 # 原始JSON
                 self.send_response(200)
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
@@ -1693,6 +1723,9 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                     self.wfile.write(b"{}")
             else:
                 self.send_response(200)
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
                                 # ── 3区服务端渲染: 系统+网络+下载 ──
@@ -1888,12 +1921,16 @@ def _make_handler(progress_file: str, ssh_target, extra_nodes=None):
                         max_temp = max(max_temp, float(s2["gpu_temp"]))
                     if s2.get("uptime"):
                         t = s2["uptime"]
-                        for unit in ("天","days","d"):
-                            if unit in t:
-                                try:
-                                    d = float(t.split(unit)[0].strip())
-                                    max_uptime = max(max_uptime, d)
-                                except: pass
+                        if isinstance(t, (int, float)):
+                            # uptime in seconds (macOS v0.5.5+)
+                            max_uptime = max(max_uptime, t / 3600)
+                        elif isinstance(t, str):
+                            for unit in ("天","days","d"):
+                                if unit in t:
+                                    try:
+                                        d = float(t.split(unit)[0].strip())
+                                        max_uptime = max(max_uptime, d)
+                                    except: pass
                 m_online = f'{online_nodes}/{node_count}'
                 m_temp = f'{int(max_temp)}C' if max_temp else '--C'
                 m_uptime = f'{int(max_uptime)}h' if max_uptime else '--h'
@@ -2007,6 +2044,7 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .alert-banner.critical{background:rgba(255,40,40,0.12);border:1px solid rgba(255,40,40,0.35);color:#f66;box-shadow:0 0 20px rgba(255,40,40,0.08)}
 .alert-banner.warning{background:rgba(255,170,0,0.10);border:1px solid rgba(255,170,0,0.30);color:#fa0;box-shadow:0 0 20px rgba(255,170,0,0.06)}
 </style>
+<style>
 /* === 编辑模式 === */
 .edit-mode .nodes-grid{max-width:55%}.edit-mode .metric-row{max-width:55%}.edit-mode .sidebar{display:none}.edit-mode .bot-bar{max-width:55%}.edit-mode .main{max-width:55%;padding-right:4px}
 #edit-panel{position:fixed;top:0;right:0;bottom:0;width:44%;background:#0c0c1e;border-left:1px solid #1a1a3a;z-index:9999;display:none;flex-direction:column;font-size:12px}
