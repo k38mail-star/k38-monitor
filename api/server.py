@@ -49,21 +49,37 @@ def _get_collector() -> Collector:
     return _collector
 
 
-def _get_report() -> CollectorReport:
-    """Return a cached or fresh CollectorReport."""
+async def _get_report_async() -> CollectorReport:
+    """Return a cached or fresh CollectorReport (async version for uvicorn)."""
     global _cache
     now = time.time()
     if _cache["data"] is None or (now - _cache["ts"]) > _CACHE_TTL:
-        import asyncio
-
         collector = _get_collector()
-        try:
-            _cache["data"] = asyncio.run(collector.collect())
-        except RuntimeError:
-            loop = asyncio.get_event_loop()
-            _cache["data"] = loop.run_until_complete(collector.collect())
+        _cache["data"] = await collector.collect()
         _cache["ts"] = time.time()
     return _cache["data"]
+
+
+def _get_report_sync(retries: int = 2) -> CollectorReport | None:
+    """Return a cached or fresh CollectorReport (sync version for fallback)."""
+    global _cache
+    now = time.time()
+    if _cache["data"] is not None and (now - _cache["ts"]) <= _CACHE_TTL:
+        return _cache["data"]
+    
+    import asyncio
+    collector = _get_collector()
+    for attempt in range(retries):
+        try:
+            _cache["data"] = asyncio.run(collector.collect())
+            _cache["ts"] = time.time()
+            return _cache["data"]
+        except RuntimeError:
+            # Event loop already running — should not happen in fallback mode
+            if attempt == retries - 1:
+                raise
+            continue
+    return None
 
 
 def _to_dict(obj: Any) -> dict[str, Any]:
@@ -74,8 +90,6 @@ def _to_dict(obj: Any) -> dict[str, Any]:
         return {str(k): _to_dict(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_to_dict(item) for item in obj]
-    if isinstance(obj, ReportEncoder):
-        return obj
     return obj
 
 
@@ -86,22 +100,33 @@ def _handle_status() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "dltrace-api",
-        "version": "0.6.0",
+        "version": "0.6.1",
         "ts": time.time(),
     }
 
 
-def _handle_system() -> tuple[dict[str, Any], int]:
+async def _handle_system_async() -> tuple[dict[str, Any], int]:
     try:
-        report = _get_report()
+        report = await _get_report_async()
         return _to_dict(report.system), 200
     except Exception as exc:
         return {"error": f"Failed to collect system metrics: {exc}"}, 500
 
 
-def _handle_nodes() -> dict[str, Any]:
+def _handle_system_sync() -> tuple[dict[str, Any], int]:
+    """Sync version for fallback HTTP server."""
     try:
-        report = _get_report()
+        report = _get_report_sync()
+        if report is None:
+            return {"error": "Failed to collect system metrics"}, 500
+        return _to_dict(report.system), 200
+    except Exception as exc:
+        return {"error": f"Failed to collect system metrics: {exc}"}, 500
+
+
+async def _handle_nodes_async() -> dict[str, Any]:
+    try:
+        report = await _get_report_async()
         now = time.time()
 
         local: dict[str, Any] = {
@@ -157,9 +182,85 @@ def _handle_nodes() -> dict[str, Any]:
         return {"error": f"Failed to collect node data: {exc}"}
 
 
-def _handle_history() -> dict[str, Any]:
+def _handle_nodes_sync() -> dict[str, Any]:
+    """Sync version for fallback HTTP server."""
     try:
-        report = _get_report()
+        report = _get_report_sync()
+        if report is None:
+            return {"error": "Failed to collect node data"}
+        now = time.time()
+
+        local: dict[str, Any] = {
+            "name": report.hostname,
+            "local": True,
+            "status": "online",
+            "cpu_pct": getattr(report.system, "cpu_pct", None),
+            "mem_pct": getattr(report.system, "mem_pct", None),
+            "gpu_pct": getattr(report.system, "gpu_pct", None),
+            "gpu_temp": getattr(report.system, "gpu_temp", None),
+            "disk_pct": getattr(report.system, "disk_pct", None),
+            "uptime": getattr(report.system, "uptime", None),
+        }
+
+        remotes: dict[str, dict[str, Any]] = {}
+        for name, data in report.nodes.items():
+            remotes[name] = {
+                "name": name,
+                "local": False,
+                "status": data.get("status", "unknown"),
+                "cpu_pct": data.get("cpu_pct"),
+                "mem_pct": data.get("mem_pct"),
+                "gpu_pct": data.get("gpu_pct"),
+                "gpu_temp": data.get("gpu_temp"),
+                "disk_pct": data.get("disk_pct"),
+                "uptime": data.get("uptime"),
+                "ts": data.get("ts"),
+            }
+
+        config = _get_collector().config
+        for name in config.node_config:
+            if name not in remotes:
+                remotes[name] = {
+                    "name": name,
+                    "local": False,
+                    "status": "offline",
+                    "cpu_pct": None,
+                    "mem_pct": None,
+                    "gpu_pct": None,
+                    "gpu_temp": None,
+                    "disk_pct": None,
+                    "uptime": None,
+                    "ts": None,
+                }
+
+        all_nodes = [local] + list(remotes.values())
+        return {
+            "nodes": all_nodes,
+            "count": len(all_nodes),
+            "ts": now,
+        }
+    except Exception as exc:
+        return {"error": f"Failed to collect node data: {exc}"}
+
+
+async def _handle_history_async() -> dict[str, Any]:
+    try:
+        report = await _get_report_async()
+        return {
+            "history": report.history,
+            "ts": report.ts,
+            "gpu_trends": report.gpu_trends,
+        }
+    except Exception as exc:
+        return {"error": f"Failed to collect history: {exc}"}
+
+
+def _handle_history_sync() -> dict[str, Any]:
+    """Sync version for fallback HTTP server."""
+    try:
+        report = _get_report_sync()
+        if report is None:
+            return {"error": "Failed to collect history"}
         return {
             "history": report.history,
             "ts": report.ts,
@@ -176,7 +277,7 @@ def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     app = FastAPI(
         title="dltrace API",
-        version="0.6.0",
+        version="0.6.1",
         description="K38 cluster monitoring API",
     )
 
@@ -195,16 +296,16 @@ def create_app() -> FastAPI:
 
     @app.get("/api/system")
     async def api_system() -> JSONResponse:
-        data, status_code = _handle_system()
+        data, status_code = await _handle_system_async()
         return JSONResponse(content=data, status_code=status_code)
 
     @app.get("/api/nodes")
     async def api_nodes() -> dict[str, Any]:
-        return _handle_nodes()
+        return await _handle_nodes_async()
 
     @app.get("/api/history")
     async def api_history() -> dict[str, Any]:
-        return _handle_history()
+        return await _handle_history_async()
 
     return app
 
@@ -226,7 +327,7 @@ def run_server(host: str = "0.0.0.0", port: int = 8899, reload: bool = False) ->
         return
 
     uvicorn.run(
-        "dltrace.api.server:create_app",
+        "api.server:create_app",
         host=host,
         port=port,
         reload=reload,
@@ -268,13 +369,13 @@ def _run_fallback(host: str = "0.0.0.0", port: int = 8899) -> None:
                 if path == "/status":
                     data = _handle_status()
                 elif path == "/api/system":
-                    data, code = _handle_system()
+                    data, code = _handle_system_sync()
                     self._send_json(data, code)
                     return
                 elif path == "/api/nodes":
-                    data = _handle_nodes()
+                    data = _handle_nodes_sync()
                 elif path == "/api/history":
-                    data = _handle_history()
+                    data = _handle_history_sync()
                 else:
                     data = {"error": "Not found"}
                     self._send_json(data, 404)

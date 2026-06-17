@@ -18,8 +18,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 
-from .server import create_app, run_server
+# When run directly (python3 api/__init__.py), add parent to sys.path
+# so package-absolute imports work.
+_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PARENT not in sys.path:
+    sys.path.insert(0, _PARENT)
+
+from api.server import create_app, run_server  # type: ignore[import-untyped]
 
 __all__ = ["create_app", "run_server"]
 
