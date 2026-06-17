@@ -131,7 +131,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        print(f"[dltrace-web] {args[0]} {args[1]} {args[2]}")
+        if len(args) >= 3:
+            print(f"[dltrace-web] {args[0]} {args[1]} {args[2]}")
+        elif args:
+            print(f"[dltrace-web] {fmt % args}")
+        else:
+            print(f"[dltrace-web] {fmt}")
 
 
 def serve_dashboard(

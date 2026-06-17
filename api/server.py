@@ -100,7 +100,7 @@ def _handle_status() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "dltrace-api",
-        "version": "0.6.1",
+        "version": "0.6.2",
         "ts": time.time(),
     }
 
@@ -277,7 +277,7 @@ def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     app = FastAPI(
         title="dltrace API",
-        version="0.6.1",
+        version="0.6.2",
         description="K38 cluster monitoring API",
     )
 
