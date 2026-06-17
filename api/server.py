@@ -313,6 +313,51 @@ def create_app() -> FastAPI:
         data, status_code = await _handle_system_async()
         return JSONResponse(content=data, status_code=status_code)
 
+    # ── Auto-deploy webhook (GitHub) ────────────────────────────────────
+    @app.post("/api/webhook")
+    async def api_webhook(request: Request) -> dict[str, Any]:
+        event = request.headers.get("X-GitHub-Event", "")
+        payload = await request.json()
+        ref = payload.get("ref", "")
+
+        if event == "ping":
+            return {"msg": "pong"}
+
+        if not ref.startswith("refs/tags/"):
+            return {"msg": "ignored", "ref": ref}
+
+        tag = ref.replace("refs/tags/", "")
+
+        # Run deploy in a thread so POST returns immediately
+        def _deploy(tag: str) -> None:
+            import subprocess
+            import time
+            dltrace_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            log_path = "/tmp/dltrace-auto-deploy.log"
+            try:
+                subprocess.run(["git", "fetch", "--tags", "origin"],
+                               cwd=dltrace_dir, capture_output=True, timeout=30)
+                subprocess.run(["git", "checkout", tag],
+                               cwd=dltrace_dir, capture_output=True, timeout=30)
+                subprocess.run(["pkill", "-f", "api/__init__"],
+                               capture_output=True, timeout=5)
+                subprocess.run(["pkill", "-f", "web/__init__"],
+                               capture_output=True, timeout=5)
+                time.sleep(2)
+                subprocess.Popen(["python3", "api/__init__.py", "--port", "8899", "--host", "0.0.0.0"],
+                                 cwd=dltrace_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(3)
+                subprocess.Popen(["python3", "web/__init__.py", "--port", "9900", "--host", "0.0.0.0",
+                                 "--api-url", "http://localhost:8899"],
+                                 cwd=dltrace_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                with open(log_path, "a") as f:
+                    f.write(f"[{time.ctime()}] Deploy {tag} failed: {e}\n")
+
+        import threading
+        threading.Thread(target=_deploy, args=(tag,), daemon=True).start()
+        return {"msg": "deploying", "tag": tag}
+
     return app
 
 
