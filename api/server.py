@@ -307,6 +307,12 @@ def create_app() -> FastAPI:
     async def api_history() -> dict[str, Any]:
         return await _handle_history_async()
 
+    # Backward-compat alias for old collector HTTP polling
+    @app.get("/api/v1/metrics")
+    async def api_metrics() -> JSONResponse:
+        data, status_code = await _handle_system_async()
+        return JSONResponse(content=data, status_code=status_code)
+
     return app
 
 

@@ -25,10 +25,11 @@ class CollectorConfig:
     max_processes: int = 10
     node_config: dict[str, str] = field(
         default_factory=lambda: {
-            "三万八": "http://192.168.3.29:8899/api/v1/metrics",
-            "小四": "http://192.168.3.46:8899/api/v1/metrics",
+            "三万八": "http://192.168.3.29:8899/api/system",
+            "小四": "http://192.168.3.46:8899/api/system",
             "大傻": "jager-dgx@192.168.3.55",
             "二傻": "jager-dgx-2@192.168.3.45",
+            "香港ECS": "https://dlt.k38.ai/dashboard/api/system",
         }
     )
     version: str = DEFAULT_VERSION
